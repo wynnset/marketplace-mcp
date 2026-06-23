@@ -32,38 +32,49 @@ before it calls a tool — the tools just declare parameters.
   raw text) pulled straight off the results page.
 - **`get_listing_details`** — full description / condition for one listing URL.
 
-## Setup
+## Setup — one command
 
-> **Just want the full walkthrough?** See **[DEPLOY.md](DEPLOY.md)** — every step
-> from zero to asking claude.ai to search Marketplace for you (install, login,
-> tunnel, claude.ai connector, daily restart routine, troubleshooting).
+> **Want the step-by-step + troubleshooting?** See **[DEPLOY.md](DEPLOY.md)**.
 
 ```bash
-python3 -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
-python -m playwright install chromium
-
-python server.py login     # one-time: sign into Facebook, then close the window
-python server.py serve      # starts the MCP server on http://localhost:8000/mcp
+brew install cloudflared          # if you don't have it yet
+./finder install
 ```
 
-Then expose it and register it with claude.ai:
+`./finder install` does everything, idempotently:
 
-```bash
-cloudflared tunnel --protocol http2 --url http://localhost:8000
-#   (or:  ngrok http 8000)
+1. creates the virtualenv, installs deps, downloads Chromium,
+2. opens a browser for your one-time **Facebook login**,
+3. sets up a **permanent Cloudflare tunnel** to `https://mcp.<your-domain>/mcp`
+   (a named tunnel routed to a domain you manage in Cloudflare — the URL never
+   changes), and
+4. installs **launchd services** so the server + tunnel **auto-start at login**
+   and restart themselves if they crash. No terminals to babysit.
+
+When it finishes it prints your permanent connector URL. Paste it **once** into
+**claude.ai → Settings → Connectors → Add custom connector**:
+
 ```
-
-In **claude.ai → Settings → Connectors → Add custom connector**, paste the
-tunnel URL with the MCP path:
-
-```
-https://<your-tunnel-host>/mcp
+https://mcp.<your-domain>/mcp
 ```
 
 Now ask claude.ai things like *"find me a used Herman Miller Aeron under $400 in
 Seattle, listed this week."* It will ask for anything it's missing, then call the
 search tool, which runs in your browser.
+
+### Managing it
+
+```bash
+./finder status      # health of server + tunnel, and your connector URL
+./finder logs        # tail the live logs
+./finder restart     # bounce both services
+./finder login       # re-log into Facebook when the session expires
+./finder stop        # /start, /uninstall also available
+```
+
+Because the tunnel host is now **stable**, the server pins it via
+`MCP_ALLOWED_HOSTS` — DNS-rebinding protection is back **on** (the old rotating
+quick-tunnel URL couldn't do this).
 
 ## Config (environment variables, all optional)
 

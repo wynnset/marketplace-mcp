@@ -1,0 +1,320 @@
+#!/usr/bin/env bash
+#
+# finder — one command to install, run, and manage the Marketplace Finder MCP
+# server + its Cloudflare tunnel on your Mac.
+#
+# The goal: after `./finder install` you have a PERMANENT URL
+# (https://mcp.<your-domain>/mcp) that auto-starts at login and self-heals if it
+# crashes. You paste that URL into claude.ai once and never touch it again.
+#
+# Subcommands:
+#   ./finder install     one-time setup: deps, Facebook login, Cloudflare tunnel,
+#                         and auto-start services. Safe to re-run (idempotent).
+#   ./finder start        start the server + tunnel services
+#   ./finder stop         stop them
+#   ./finder restart      restart them
+#   ./finder status       show health + your permanent connector URL
+#   ./finder logs         tail the server + tunnel logs
+#   ./finder url          print the claude.ai connector URL
+#   ./finder login        re-log into Facebook (when the session expires)
+#   ./finder uninstall    remove the auto-start services (keeps your code/login)
+#
+set -euo pipefail
+
+# ─── paths & constants ────────────────────────────────────────────────────────
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV="$REPO/.venv"
+PY="$VENV/bin/python"
+CONFIG="$REPO/.finder.env"            # gitignored; remembers your domain/hostname
+CF_DIR="$HOME/.cloudflared"
+TUNNEL_NAME="marketplace-mcp"
+CF_CONFIG="$CF_DIR/$TUNNEL_NAME.yml"
+LA_DIR="$HOME/Library/LaunchAgents"
+SERVER_LABEL="com.wynnset.finder.server"
+TUNNEL_LABEL="com.wynnset.finder.tunnel"
+SERVER_PLIST="$LA_DIR/$SERVER_LABEL.plist"
+TUNNEL_PLIST="$LA_DIR/$TUNNEL_LABEL.plist"
+GUI="gui/$(id -u)"
+PORT="${MCP_PORT:-8000}"
+
+bold() { printf '\033[1m%s\033[0m\n' "$1"; }
+ok()   { printf '\033[32m✓\033[0m %s\n' "$1"; }
+warn() { printf '\033[33m!\033[0m %s\n' "$1"; }
+err()  { printf '\033[31m✗\033[0m %s\n' "$1" >&2; }
+die()  { err "$1"; exit 1; }
+
+CLOUDFLARED="$(command -v cloudflared || true)"
+
+# ─── config persistence (domain / hostname) ───────────────────────────────────
+load_config() { [ -f "$CONFIG" ] && set -a && . "$CONFIG" && set +a || true; }
+
+save_config() {
+  cat > "$CONFIG" <<EOF
+# Written by ./finder install — your permanent endpoint settings.
+FINDER_HOSTNAME="$FINDER_HOSTNAME"
+EOF
+}
+
+# ─── bootstrap: venv + python deps + chromium ─────────────────────────────────
+bootstrap_python() {
+  bold "1/4  Python environment"
+  command -v python3 >/dev/null || die "python3 not found. Install Python 3.10+ first."
+  if [ ! -x "$PY" ]; then
+    python3 -m venv "$VENV"
+    ok "created virtualenv (.venv)"
+  else
+    ok "virtualenv present"
+  fi
+  "$PY" -m pip install --quiet --upgrade pip
+  "$PY" -m pip install --quiet -r "$REPO/requirements.txt"
+  ok "python dependencies installed"
+  # Install Chromium only if Playwright can't find it yet (idempotent + cheap to recheck).
+  if [ ! -d "$HOME/Library/Caches/ms-playwright" ] || \
+     [ -z "$(ls -A "$HOME/Library/Caches/ms-playwright" 2>/dev/null | grep -i chromium || true)" ]; then
+    bold "    downloading Chromium (~150 MB, one time)…"
+    "$PY" -m playwright install chromium
+  fi
+  ok "Chromium ready"
+}
+
+# ─── Facebook login (only if no saved session yet) ────────────────────────────
+ensure_fb_login() {
+  bold "2/4  Facebook session"
+  if [ -d "$REPO/.browser-profile" ]; then
+    ok "logged-in browser profile found (re-run './finder login' if FB logs you out)"
+    return
+  fi
+  warn "no saved Facebook session — opening a browser to log in"
+  echo "    A Chrome window will open. Log into Facebook, then close the window."
+  read -r -p "    Press Enter to open the login browser… " _ || true
+  "$PY" "$REPO/server.py" login
+  ok "Facebook session saved"
+}
+
+# ─── Cloudflare named tunnel (permanent URL) ──────────────────────────────────
+ensure_tunnel() {
+  bold "3/4  Cloudflare tunnel (your permanent URL)"
+  [ -n "$CLOUDFLARED" ] || die "cloudflared not found. Install it:  brew install cloudflared"
+
+  # Hostname: mcp.<your-domain>. Ask once, remember it.
+  if [ -z "${FINDER_HOSTNAME:-}" ]; then
+    echo "    Your permanent endpoint will be https://<hostname>/mcp"
+    echo "    The domain must be one you manage in Cloudflare DNS (e.g. wynnset.com)."
+    read -r -p "    Hostname to use [mcp.wynnset.com]: " FINDER_HOSTNAME
+    FINDER_HOSTNAME="${FINDER_HOSTNAME:-mcp.wynnset.com}"
+  fi
+  save_config
+  ok "hostname: $FINDER_HOSTNAME"
+
+  # Authorize cloudflared to a zone (browser, one time).
+  if [ ! -f "$CF_DIR/cert.pem" ]; then
+    warn "cloudflared isn't authorized yet — a browser will open"
+    echo "    Pick the domain that owns '$FINDER_HOSTNAME' and Authorize."
+    read -r -p "    Press Enter to open the Cloudflare login… " _ || true
+    "$CLOUDFLARED" tunnel login
+  fi
+  [ -f "$CF_DIR/cert.pem" ] || die "Cloudflare authorization (cert.pem) not found — re-run and complete the browser step."
+  ok "cloudflared authorized"
+
+  # Create the named tunnel if it doesn't already exist.
+  if "$CLOUDFLARED" tunnel list 2>/dev/null | awk '{print $2}' | grep -qx "$TUNNEL_NAME"; then
+    ok "tunnel '$TUNNEL_NAME' already exists"
+  else
+    "$CLOUDFLARED" tunnel create "$TUNNEL_NAME"
+    ok "tunnel '$TUNNEL_NAME' created"
+  fi
+
+  # Resolve the credentials file (…/<UUID>.json) for this tunnel.
+  local uuid creds
+  uuid="$("$CLOUDFLARED" tunnel list 2>/dev/null | awk -v n="$TUNNEL_NAME" '$2==n{print $1}' | head -1)"
+  [ -n "$uuid" ] || die "couldn't determine tunnel UUID for '$TUNNEL_NAME'"
+  creds="$CF_DIR/$uuid.json"
+  [ -f "$creds" ] || die "tunnel credentials not found at $creds"
+
+  # Write the ingress config: route the public hostname to the local server.
+  cat > "$CF_CONFIG" <<EOF
+# Written by ./finder install — maps $FINDER_HOSTNAME to the local MCP server.
+tunnel: $TUNNEL_NAME
+credentials-file: $creds
+ingress:
+  - hostname: $FINDER_HOSTNAME
+    service: http://localhost:$PORT
+  - service: http_status:404
+EOF
+  ok "tunnel config written ($CF_CONFIG)"
+
+  # Point the DNS record at the tunnel (idempotent; tolerate "already exists").
+  if "$CLOUDFLARED" tunnel route dns "$TUNNEL_NAME" "$FINDER_HOSTNAME" 2>/tmp/finder-dns.$$; then
+    ok "DNS routed: $FINDER_HOSTNAME → tunnel"
+  else
+    if grep -qi "already exists\|record with that host" /tmp/finder-dns.$$; then
+      ok "DNS already routed for $FINDER_HOSTNAME"
+    else
+      warn "DNS route step reported:"; sed 's/^/      /' /tmp/finder-dns.$$
+      warn "If '$FINDER_HOSTNAME' already points elsewhere, fix it in the Cloudflare dashboard (CNAME → $uuid.cfargotunnel.com)."
+    fi
+  fi
+  rm -f /tmp/finder-dns.$$
+}
+
+# ─── launchd services (auto-start at login, self-heal) ────────────────────────
+write_plists() {
+  mkdir -p "$LA_DIR" "$REPO/logs"
+  cat > "$SERVER_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$SERVER_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$PY</string>
+    <string>$REPO/server.py</string>
+    <string>serve</string>
+  </array>
+  <key>WorkingDirectory</key><string>$REPO</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>MCP_HOST</key><string>127.0.0.1</string>
+    <key>MCP_PORT</key><string>$PORT</string>
+    <key>MCP_ALLOWED_HOSTS</key><string>$FINDER_HOSTNAME</string>
+    <key>FB_HEADLESS</key><string>1</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$REPO/logs/server.out.log</string>
+  <key>StandardErrorPath</key><string>$REPO/logs/server.err.log</string>
+</dict></plist>
+EOF
+
+  cat > "$TUNNEL_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$TUNNEL_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$CLOUDFLARED</string>
+    <string>tunnel</string>
+    <string>--no-autoupdate</string>
+    <string>--config</string>
+    <string>$CF_CONFIG</string>
+    <string>run</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$REPO/logs/tunnel.out.log</string>
+  <key>StandardErrorPath</key><string>$REPO/logs/tunnel.err.log</string>
+</dict></plist>
+EOF
+}
+
+boot_service() {  # bootstrap (load) a plist, replacing any existing instance
+  local label="$1" plist="$2"
+  launchctl bootout "$GUI/$label" 2>/dev/null || true
+  launchctl bootstrap "$GUI" "$plist"
+}
+
+install_services() {
+  bold "4/4  Auto-start services"
+  write_plists
+  boot_service "$SERVER_LABEL" "$SERVER_PLIST"
+  boot_service "$TUNNEL_LABEL" "$TUNNEL_PLIST"
+  ok "services installed and started (auto-start at login is on)"
+}
+
+# ─── service control ──────────────────────────────────────────────────────────
+require_installed() {
+  [ -f "$SERVER_PLIST" ] || die "Not installed yet. Run:  ./finder install"
+}
+
+svc_start()   { require_installed; boot_service "$SERVER_LABEL" "$SERVER_PLIST"; boot_service "$TUNNEL_LABEL" "$TUNNEL_PLIST"; ok "started"; }
+svc_stop()    { launchctl bootout "$GUI/$SERVER_LABEL" 2>/dev/null || true; launchctl bootout "$GUI/$TUNNEL_LABEL" 2>/dev/null || true; ok "stopped"; }
+svc_restart() { launchctl kickstart -k "$GUI/$SERVER_LABEL" 2>/dev/null || svc_start; launchctl kickstart -k "$GUI/$TUNNEL_LABEL" 2>/dev/null || true; ok "restarted"; }
+
+cmd_status() {
+  load_config
+  bold "Marketplace Finder — status"
+  # local server
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/mcp" 2>/dev/null || echo 000)"
+  if [ "$code" != "000" ]; then ok "local server: up (http://127.0.0.1:$PORT/mcp → HTTP $code)"
+  else err "local server: DOWN"; fi
+  # launchd
+  if launchctl print "$GUI/$SERVER_LABEL" >/dev/null 2>&1; then ok "server service: loaded"; else warn "server service: not loaded"; fi
+  if launchctl print "$GUI/$TUNNEL_LABEL" >/dev/null 2>&1; then ok "tunnel service: loaded"; else warn "tunnel service: not loaded"; fi
+  # public endpoint
+  if [ -n "${FINDER_HOSTNAME:-}" ]; then
+    local pub
+    pub="$(curl -s -m 8 -o /dev/null -w '%{http_code}' "https://$FINDER_HOSTNAME/mcp" 2>/dev/null || echo 000)"
+    if [ "$pub" != "000" ]; then ok "public endpoint: reachable (https://$FINDER_HOSTNAME/mcp → HTTP $pub)"
+    else warn "public endpoint: not reachable yet (DNS can take a minute on first setup)"; fi
+    echo; bold "Connector URL for claude.ai:"; echo "    https://$FINDER_HOSTNAME/mcp"
+  else
+    warn "no hostname configured — run ./finder install"
+  fi
+}
+
+cmd_url() { load_config; [ -n "${FINDER_HOSTNAME:-}" ] && echo "https://$FINDER_HOSTNAME/mcp" || die "Not configured. Run ./finder install"; }
+
+cmd_logs() {
+  bold "Tailing logs (Ctrl-C to stop)…"
+  touch "$REPO/logs/server.err.log" "$REPO/logs/tunnel.err.log" "$REPO/server.log" 2>/dev/null || true
+  tail -f "$REPO/server.log" "$REPO/logs/server.err.log" "$REPO/logs/tunnel.err.log"
+}
+
+cmd_login() {
+  bold "Re-logging into Facebook"
+  warn "stopping the server so it releases the browser profile…"
+  launchctl bootout "$GUI/$SERVER_LABEL" 2>/dev/null || true
+  [ -x "$PY" ] || die "Run ./finder install first."
+  "$PY" "$REPO/server.py" login
+  if [ -f "$SERVER_PLIST" ]; then boot_service "$SERVER_LABEL" "$SERVER_PLIST"; ok "server restarted"; fi
+}
+
+cmd_uninstall() {
+  bold "Removing auto-start services"
+  svc_stop
+  rm -f "$SERVER_PLIST" "$TUNNEL_PLIST"
+  ok "services removed (your code, Facebook login, and Cloudflare tunnel are untouched)"
+  echo "    To also delete the Cloudflare tunnel:  cloudflared tunnel delete $TUNNEL_NAME"
+}
+
+cmd_install() {
+  load_config
+  bold "Installing Marketplace Finder (permanent URL + auto-start)"
+  echo
+  bootstrap_python
+  echo
+  ensure_fb_login
+  echo
+  ensure_tunnel
+  echo
+  install_services
+  echo
+  bold "Done. 🎉  Give DNS/tunnel ~30s, then check:"
+  echo "    ./finder status"
+  echo
+  bold "Add this ONE URL to claude.ai → Settings → Connectors (never changes):"
+  echo "    https://$FINDER_HOSTNAME/mcp"
+}
+
+usage() {
+  # Print the leading comment block (skip the shebang + the first bare `#`).
+  awk 'NR<=2{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "${BASH_SOURCE[0]}"
+}
+
+# ─── dispatch ─────────────────────────────────────────────────────────────────
+load_config
+case "${1:-}" in
+  install)   cmd_install ;;
+  start)     svc_start ;;
+  stop)      svc_stop ;;
+  restart)   svc_restart ;;
+  status)    cmd_status ;;
+  url)       cmd_url ;;
+  logs)      cmd_logs ;;
+  login)     cmd_login ;;
+  uninstall) cmd_uninstall ;;
+  ""|-h|--help|help) usage ;;
+  *) err "unknown command: $1"; echo; usage; exit 1 ;;
+esac

@@ -1,171 +1,103 @@
-# Deploy & use — every step from zero to "Claude, search Marketplace for me"
+# Deploy & use — from zero to "Claude, search Marketplace for me"
 
-This is the full linear sequence. By the end you'll be able to message claude.ai
-*"find me a used Aeron chair under $400 in Seattle"* and have it search Facebook
-Marketplace in your own logged-in browser.
-
-There are **two terminal windows that must stay running** while you use this:
-one for the server, one for the tunnel. That's normal — close them and the
-connector goes offline until you start them again (see [Daily use](#8-daily-use--restarting)).
+By the end you'll be able to message claude.ai *"find me a used Aeron chair under
+$400 in Seattle"* and have it search Facebook Marketplace in your own logged-in
+browser — over a **permanent URL** that **auto-starts at login**. No terminals to
+keep open, no URL to re-paste.
 
 ---
 
-## 0. Prerequisites (one-time)
+## The fast path: `./finder install`
 
-- **macOS** with Python **3.10+** (you have 3.14 — fine).
-- A **claude.ai paid plan** (Pro / Max / Team / Enterprise). Custom connectors
-  are not available on the free tier.
-- **Homebrew** (you have it) — used to install the tunnel tool.
+### 0. Prerequisites (one-time)
 
----
+- **macOS** with Python **3.10+**.
+- A **claude.ai paid plan** (Pro / Max / Team / Enterprise) — custom connectors
+  aren't on the free tier.
+- **Homebrew**, and `cloudflared`:  `brew install cloudflared`
+- A **domain you manage in Cloudflare DNS** (e.g. `wynnset.com`). The permanent
+  endpoint will be a subdomain of it, like `mcp.wynnset.com`. If your domain
+  isn't on Cloudflare yet, add it (free) at dash.cloudflare.com first.
 
-## 1. Install the app (one-time, ~2 min + a browser download)
+### 1. Run the installer
 
 ```bash
 cd marketplace-mcp
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-python -m playwright install chromium      # downloads a private Chromium (~150 MB)
+./finder install
 ```
 
-> If you already ran these during setup, you can skip — but re-run
-> `python -m playwright install chromium` if you ever see a "browser not found" error.
+It walks through four steps and is **safe to re-run** (it skips anything already
+done):
 
----
+1. **Python environment** — creates `.venv`, installs deps, downloads Chromium
+   (~150 MB, first time only).
+2. **Facebook session** — if you've never logged in, it opens a real Chrome
+   window. **Log into Facebook normally** (handle 2FA), land on your home feed,
+   then **close the window**. Saved to `.browser-profile/`.
+3. **Cloudflare tunnel** — asks for your hostname (default `mcp.wynnset.com`),
+   then:
+   - opens a browser to **authorize cloudflared** — pick the domain that owns
+     that hostname and click **Authorize** (one time);
+   - creates a named tunnel `marketplace-mcp`;
+   - writes its ingress config and **routes DNS** so `mcp.<domain>` → the tunnel.
+4. **Auto-start services** — installs two launchd agents (server + tunnel) that
+   start now, **start again at every login**, and **restart on crash**.
 
-## 2. Log into Facebook (one-time, until the session expires)
+When it finishes it prints your permanent URL:
+
+```
+https://mcp.<your-domain>/mcp
+```
+
+### 2. Verify
 
 ```bash
-. .venv/bin/activate          # if not already active
-python server.py login
+./finder status
 ```
 
-A real Chrome window opens. **Log into Facebook normally** (handle any 2FA),
-make sure you land on your logged-in home feed, then **close the window**.
-The session is saved to `.browser-profile/` and reused by the server.
+You want to see the local server **up**, both services **loaded**, and the public
+endpoint **reachable** (DNS can take ~30–60s the very first time).
 
-You only redo this if Facebook later logs you out (the search tool will tell you
-when that happens).
+### 3. Add it to claude.ai — once, forever
 
----
+1. **claude.ai → Settings → Connectors → Add custom connector.**
+2. **Name:** `Marketplace Finder`
+3. **URL:** your permanent endpoint, e.g. `https://mcp.wynnset.com/mcp`
+4. Save. claude.ai discovers the two tools.
+5. In a chat, make sure the connector is **enabled** (toggle near the message box).
 
-## 3. Start the server (keep this terminal open)
+Because the URL never changes, you do this **once** and never again.
 
-```bash
-. .venv/bin/activate
-python server.py serve
-```
+### 4. Use it 🎉
 
-You should see:
-
-```
-Auth: OPEN (no MCP_AUTH_TOKEN set) — keep your tunnel URL private
-Marketplace Finder MCP on http://127.0.0.1:8000/mcp
-```
-
-Leave this running. Confirm it's alive from **another** terminal:
-
-```bash
-curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/mcp
-# a number like 400/406 means "listening" (it rejects a bare GET — that's expected)
-# "connection refused" means it isn't running
-```
-
-*(Optional, best local test)* — drive the tools with the MCP Inspector:
-
-```bash
-npx @modelcontextprotocol/inspector
-# open the URL it prints, set Transport = "Streamable HTTP",
-# URL = http://127.0.0.1:8000/mcp, Connect, then run search_facebook_marketplace
-```
-
----
-
-## 4. Install the tunnel tool (one-time)
-
-claude.ai lives in the cloud and can't reach `localhost`. A tunnel gives your
-local server a public HTTPS URL. `cloudflared` needs no account and is simplest:
-
-```bash
-brew install cloudflared
-```
-
----
-
-## 5. Start the tunnel (keep this terminal open too)
-
-In a **new** terminal (leave the server running in the other one):
-
-```bash
-cloudflared tunnel --protocol http2 --url http://localhost:8000
-```
-
-It prints a line like:
-
-```
-https://random-words-here.trycloudflare.com
-```
-
-That's your public base URL. **Your MCP endpoint is that URL + `/mcp`:**
-
-```
-https://random-words-here.trycloudflare.com/mcp
-```
-
-> ⚠️ A quick tunnel gets a **new random URL every time you restart it**. Fine for
-> personal use — you just re-paste the new URL into claude.ai when it changes.
-> For a permanent URL see [Stable URL](#stable-url-optional) below.
-
----
-
-## 6. Add it to claude.ai (re-do only when the URL changes)
-
-1. Go to **claude.ai → Settings → Connectors** (a.k.a. "Custom connectors").
-2. Click **Add custom connector**.
-3. **Name:** `Marketplace Finder`
-4. **URL:** paste your endpoint, e.g.
-   `https://random-words-here.trycloudflare.com/mcp`
-5. Save. claude.ai connects and discovers the two tools
-   (`search_facebook_marketplace`, `get_listing_details`).
-6. In a chat, make sure the connector is **enabled** for that conversation
-   (the connectors/tools toggle near the message box).
-
-> Leave `MCP_AUTH_TOKEN` unset for this flow — the custom-connector UI connects
-> without a bearer header, so the endpoint must be open. Your protection is the
-> unguessable tunnel URL. (To lock it down properly, use a named tunnel behind
-> Cloudflare Access — out of scope here.)
-
----
-
-## 7. Use it 🎉
-
-In that chat, just ask in plain language. Examples:
+Just ask in plain language:
 
 - *"Search Facebook Marketplace for a used Herman Miller Aeron chair under $400 in Seattle, listed in the last week."*
 - *"Find me a Yeti Tundra 45 cooler near Vancouver, newest first, show me 15."*
 - *"Look for a 27-inch 4K monitor under $250 in NYC, then give me the full details on the cheapest one."*
 
-Claude will ask you for anything it's missing (usually **budget** and **city**),
-then call the tool. The search runs in your logged-in Chromium and returns
-titles, prices, locations, photos, and links.
+Claude asks for anything it's missing (usually **budget** and **city**), then runs
+the search in your logged-in Chromium.
 
 ---
 
-## 8. Daily use / restarting
+## Day-to-day
 
-Once installed, the recurring routine is just:
+It's hands-off — the services run on their own. The `finder` CLI is there when you
+need it:
 
-```bash
-# terminal 1
-cd marketplace-mcp && . .venv/bin/activate && python server.py serve
+| Command | What it does |
+|---|---|
+| `./finder status` | server + tunnel health, plus your connector URL |
+| `./finder logs` | tail the live server + tunnel logs |
+| `./finder restart` | bounce both services |
+| `./finder stop` / `start` | stop / start both services |
+| `./finder login` | re-log into Facebook when the session expires |
+| `./finder url` | print the connector URL |
+| `./finder uninstall` | remove the auto-start services (keeps code + login + tunnel) |
 
-# terminal 2
-cloudflared tunnel --protocol http2 --url http://localhost:8000
-```
-
-- If the tunnel URL changed, update the connector URL in claude.ai (step 6).
-- If Facebook logged you out, re-run `python server.py login` (step 2).
+**If Facebook logs you out**, the search tool says so — run `./finder login`
+(it stops the server, opens the headed login, then restarts).
 
 ---
 
@@ -173,26 +105,41 @@ cloudflared tunnel --protocol http2 --url http://localhost:8000
 
 | Symptom | Fix |
 |---|---|
-| Search returns "login wall" / no results | Session expired → `python server.py login` again. |
-| claude.ai can't connect to the connector | Is `cloudflared` still running? Did the URL change? Is the server up (`curl` test in step 3)? Did you include `/mcp` at the end? |
-| "browser not found" / Playwright error | `python -m playwright install chromium`. |
+| Search returns "login wall" / no results | Session expired → `./finder login`. |
+| `./finder status` shows server DOWN | `./finder logs` to see why; `./finder restart`. |
+| Public endpoint not reachable on first setup | Give DNS ~60s, re-check `./finder status`. Confirm the CNAME exists in Cloudflare. |
+| claude.ai can't connect | Is the public endpoint reachable in `./finder status`? Did you include `/mcp`? |
+| "browser not found" / Playwright error | `.venv/bin/python -m playwright install chromium`. |
 | Connector option missing in claude.ai | Custom connectors require a paid plan. |
-| Want to watch the browser work | Start the server with `FB_HEADLESS=0 python server.py serve`. |
-| Zero results but you expect some | Try a different `city` slug (`seattle`, `nyc`, `la`, `chicago`), widen the price range, or set `sort: newest`. |
+| Want to watch the browser work | It runs headless as a service. To watch, `./finder stop` then `FB_HEADLESS=0 .venv/bin/python server.py serve` in a terminal. |
+| Zero results but you expect some | Try a different `city` slug, widen the price range, or set `sort: newest`. |
 
 ---
 
-## Stable URL (optional)
+## Appendix: the manual path (no installer)
 
-A quick tunnel's URL changes on every restart. For a permanent endpoint, create a
-**named** Cloudflare tunnel bound to a domain you control:
+If you'd rather run things by hand (or debug), the pieces underneath are:
 
 ```bash
+# one-time
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+python -m playwright install chromium
+python server.py login
+
+# permanent named tunnel (one-time)
 cloudflared tunnel login
 cloudflared tunnel create marketplace-mcp
 cloudflared tunnel route dns marketplace-mcp mcp.yourdomain.com
-cloudflared tunnel run --url http://localhost:8000 marketplace-mcp
-# endpoint becomes:  https://mcp.yourdomain.com/mcp  (stable forever)
+# write ~/.cloudflared/marketplace-mcp.yml pointing the hostname at http://localhost:8000
+
+# run (two processes)
+MCP_ALLOWED_HOSTS=mcp.yourdomain.com python server.py serve
+cloudflared tunnel --config ~/.cloudflared/marketplace-mcp.yml run
 ```
 
-Then you paste that URL into claude.ai once and never touch it again.
+`./finder install` just automates all of the above and wraps the two run-processes
+in launchd so they survive logout/crash. A throwaway **quick tunnel**
+(`cloudflared tunnel --protocol http2 --url http://localhost:8000`) still works for
+a one-off test, but its URL rotates on every restart — that's the thing the named
+tunnel fixes.

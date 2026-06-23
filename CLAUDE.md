@@ -36,12 +36,35 @@ claude.ai ──HTTPS──▶ cloudflared tunnel ──▶ local MCP server (th
 
 | File | Purpose |
 |---|---|
-| `server.py` | Everything: FastMCP server, the two tools, and the `login` CLI. |
+| `finder` | **bash CLI** that installs/runs/manages everything: deps, FB login, the permanent Cloudflare named tunnel, and the launchd auto-start services. Start here for anything operational. |
+| `server.py` | Everything else: FastMCP server, the two tools, and the `login` CLI. |
 | `requirements.txt` | `mcp`, `playwright`, `uvicorn`. |
 | `README.md` | Short overview + setup. |
 | `DEPLOY.md` | Full step-by-step deploy/use walkthrough + troubleshooting. |
 | `.browser-profile/` | **gitignored** — the logged-in FB session. Never commit. |
+| `.finder.env` | **gitignored** — remembers your tunnel hostname (`FINDER_HOSTNAME`). |
+| `logs/` | **gitignored** — launchd stdout/stderr for the server + tunnel services. |
 | `server.log` | **gitignored** — runtime log (`tail -f` it to watch searches). |
+
+### The `finder` CLI (the easy path — prefer it over manual steps)
+
+`./finder install` is one idempotent command: venv+deps+Chromium → FB login (if
+needed) → **named Cloudflare tunnel** routed to `mcp.<domain>` (permanent URL) →
+**launchd services** that auto-start at login and self-heal. Other subcommands:
+`status` (health + the connector URL), `logs`, `start`/`stop`/`restart`,
+`login` (re-auth FB; stops the server first so it releases the profile),
+`url`, `uninstall`.
+
+Two LaunchAgents live in `~/Library/LaunchAgents`:
+`com.wynnset.finder.server` (runs `.venv/bin/python server.py serve`) and
+`com.wynnset.finder.tunnel` (runs `cloudflared tunnel --config
+~/.cloudflared/marketplace-mcp.yml run`). Both `KeepAlive` + `RunAtLoad`; the CLI
+controls them via `launchctl bootstrap/bootout gui/$(id -u) …`.
+
+**Permanent host ⇒ DNS-rebinding protection is back ON.** The server LaunchAgent
+sets `MCP_ALLOWED_HOSTS=<your hostname>`, so the SDK pins the Host header. This is
+only possible because the named tunnel's host is stable — the old quick-tunnel URL
+rotated, which is why protection had to be off (see lesson #1 below).
 
 ## Tools
 
