@@ -1,0 +1,13 @@
+# the logged-in browser session — never commit this
+.browser-profile/
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# local env
+.env
+
+# runtime logs
+*.log
