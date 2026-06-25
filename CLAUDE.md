@@ -37,12 +37,14 @@ claude.ai ──HTTPS──▶ cloudflared tunnel ──▶ local MCP server (th
 | File | Purpose |
 |---|---|
 | `finder` | **bash CLI** that installs/runs/manages everything: deps, FB login, the permanent Cloudflare named tunnel, and the launchd auto-start services. Start here for anything operational. |
-| `server.py` | Everything else: FastMCP server, the two tools, and the `login` CLI. |
-| `requirements.txt` | `mcp`, `playwright`, `uvicorn`. |
+| `server.py` | Everything else: FastMCP server, the two tools, and the `login` CLI. Wires in the OAuth gate when `GOOGLE_CLIENT_ID` is set. |
+| `oauth.py` | The OAuth 2.1 authorization-server gate, fronted by **Google sign-in** (email allowlist). Only loaded when OAuth is configured. See "Auth" below. |
+| `requirements.txt` | `mcp`, `playwright`, `uvicorn`, `httpx` (httpx is for the Google token exchange). |
 | `README.md` | Short overview + setup. |
 | `DEPLOY.md` | Full step-by-step deploy/use walkthrough + troubleshooting. |
 | `.browser-profile/` | **gitignored** — the logged-in FB session. Never commit. |
-| `.finder.env` | **gitignored** — remembers your tunnel hostname (`FINDER_HOSTNAME`). |
+| `.finder.env` | **gitignored** — tunnel hostname + Google OAuth client id/secret/emails (chmod 600). |
+| `.oauth-store.json` | **gitignored** — persisted OAuth clients + issued access/refresh tokens (chmod 600), so a server restart doesn't force a claude.ai reconnect. |
 | `logs/` | **gitignored** — launchd stdout/stderr for the server + tunnel services. |
 | `server.log` | **gitignored** — runtime log (`tail -f` it to watch searches). |
 
@@ -92,6 +94,12 @@ rotated, which is why protection had to be off (see lesson #1 below).
 `MCP_HOST` (127.0.0.1) · `MCP_PORT` (8000) · `MCP_AUTH_TOKEN` (unset = open) ·
 `MCP_ALLOWED_HOSTS` (unset = DNS-rebinding protection OFF) ·
 `FB_HEADLESS` (1; set `0` to watch) · `FB_DEFAULT_CITY` (vancouver).
+
+**OAuth gate (the real lock — see "Auth" below):** setting `GOOGLE_CLIENT_ID`
+turns it on. `GOOGLE_CLIENT_SECRET` · `MCP_ALLOWED_EMAILS` (comma-separated
+allowlist) · `MCP_PUBLIC_URL` (public base URL; auto-derived from
+`MCP_ALLOWED_HOSTS` when unset). Precedence: OAuth > `MCP_AUTH_TOKEN` > open.
+`./finder install` sets these for you in the launchd plist.
 
 ## Run / deploy
 
@@ -173,6 +181,46 @@ URL. The public path was validated separately and works.
 - **More marketplaces**: add a new `@mcp.tool()` that builds that site's search
   URL and reuses the card-extraction pattern. Craigslist needs no login but
   blocks datacenter IPs → must be scraped through the same real browser.
-- **Auth**: claude.ai's custom-connector UI connects without a custom header, so
-  the endpoint runs open and the secret is the tunnel URL. For real lockdown, use
-  a named tunnel behind Cloudflare Access.
+## Auth (how the server is locked down)
+
+The endpoint is open unless `GOOGLE_CLIENT_ID` is set; `./finder install` walks
+you through turning it on. When on, **`oauth.py` runs a minimal OAuth 2.1
+authorization server *inside* this MCP server**, and the human gate is **Google
+sign-in restricted to `MCP_ALLOWED_EMAILS`**. Flow:
+
+```
+claude.ai ──/authorize──▶ this server ──redirect──▶ Google sign-in
+          ◀──token──────  ◀──/oauth/google/callback (verify email ∈ allowlist)
+```
+
+The MCP SDK (`auth_server_provider=` + `AuthSettings`) provides the
+/authorize·/token·/register·/revoke endpoints, PKCE verification, and the
+metadata docs; `oauth.py` supplies storage + the Google email gate. Tokens +
+DCR clients persist to `.oauth-store.json` so launchd restarts don't force a
+reconnect.
+
+**Why this design and not the obvious alternatives — don't regress these:**
+- **A static bearer token (`MCP_AUTH_TOKEN`) cannot lock down claude.ai.** Its
+  custom-connector UI sends no custom header; it only speaks OAuth. The token
+  gate still exists for *other* clients, but OAuth takes precedence.
+- **Cloudflare Access is broken for claude.ai web/mobile** (anthropics/
+  claude-ai-mcp#410, closed "not planned"): Access's "Managed OAuth" 401 omits
+  the RFC 9728 `WWW-Authenticate: Bearer resource_metadata="…"` header that
+  claude.ai requires (Claude Code tolerates its absence; claude.ai does not).
+  Server-native OAuth works precisely because the SDK **emits that header** — if
+  you ever see claude.ai fail at "Connect" with no login screen, check that the
+  401 from `/mcp` still carries `WWW-Authenticate` with `resource_metadata`.
+- Google's `redirect_uri` (`https://<host>/oauth/google/callback`) must match
+  the one registered in the Google Cloud OAuth client **exactly**, and is built
+  once in `oauth.py` (`self.redirect_uri`) for both the authorize and token legs.
+
+## Gotchas / future work (auth)
+
+- Verifying the OAuth flow can't go through the live `streamablehttp_client`
+  (no browser to complete Google login). Drive the provider directly instead:
+  construct `GoogleOAuthProvider`, stub `_fetch_email`, and exercise
+  `authorize()` → `google_callback()` → `/token`. (The SDK plumbing — DCR, PKCE,
+  refresh rotation, bearer 401 — is identical regardless of the email gate.)
+- **More allowed users**: add their emails to `MCP_ALLOWED_EMAILS`. Revoke by
+  removing the email (and optionally deleting their tokens from
+  `.oauth-store.json`).

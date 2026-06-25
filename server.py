@@ -193,6 +193,9 @@ def _parse_card(card: dict) -> dict:
 # ─── MCP server ───────────────────────────────────────────────────────────────
 from mcp.server.fastmcp import FastMCP  # noqa: E402
 from mcp.server.transport_security import TransportSecuritySettings  # noqa: E402
+from mcp.server.auth.settings import (  # noqa: E402
+    AuthSettings, ClientRegistrationOptions, RevocationOptions,
+)
 
 # The SDK's DNS-rebinding protection only trusts localhost by default, so it
 # rejects (HTTP 421) requests that arrive via a tunnel hostname. We're exposing
@@ -227,6 +230,52 @@ async def _lifespan(_server):
     yield
 
 
+# ─── OAuth lockdown (opt-in) ────────────────────────────────────────────────
+# Set GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET + MCP_ALLOWED_EMAILS to require
+# OAuth: claude.ai then does the OAuth 2.1 + PKCE + Dynamic Client Registration
+# dance against THIS server, and the human gate is a Google sign-in restricted
+# to the allowed emails. Without a valid token every /mcp request is 401. Leave
+# these unset to keep the legacy behaviour (open, or static MCP_AUTH_TOKEN).
+# See oauth.py for the full why.
+#
+# A static bearer (MCP_AUTH_TOKEN) can't lock down claude.ai — its connector UI
+# sends no custom header — and Cloudflare Access is broken for claude.ai web
+# (claude-ai-mcp#410). Server-native OAuth is the path that actually works, and
+# the SDK emits the RFC 9728 WWW-Authenticate header #410 was missing.
+_oauth_provider = None
+_auth_kwargs = {}
+_public_url = None
+if os.environ.get("GOOGLE_CLIENT_ID"):
+    from oauth import GoogleOAuthProvider  # noqa: E402
+
+    # Public base URL the metadata documents (and the Google redirect_uri)
+    # advertise. Behind the named tunnel this must be the public https host;
+    # locally it's 127.0.0.1. Derive a sane default from MCP_ALLOWED_HOSTS (the
+    # tunnel host) when MCP_PUBLIC_URL isn't set explicitly.
+    _public_url = os.environ.get("MCP_PUBLIC_URL")
+    if not _public_url:
+        _public_url = (
+            f"https://{_allowed[0]}" if _allowed
+            else f"http://{os.environ.get('MCP_HOST', '127.0.0.1')}:{os.environ.get('MCP_PORT', '8000')}"
+        )
+    _oauth_provider = GoogleOAuthProvider(
+        google_client_id=os.environ["GOOGLE_CLIENT_ID"],
+        google_client_secret=os.environ.get("GOOGLE_CLIENT_SECRET", ""),
+        allowed_emails=os.environ.get("MCP_ALLOWED_EMAILS", "").split(","),
+        public_url=_public_url,
+        store_path=str(ROOT / ".oauth-store.json"),
+    )
+    _auth_kwargs = dict(
+        auth_server_provider=_oauth_provider,
+        auth=AuthSettings(
+            issuer_url=_public_url,
+            resource_server_url=f"{_public_url.rstrip('/')}/mcp",
+            client_registration_options=ClientRegistrationOptions(enabled=True),
+            revocation_options=RevocationOptions(enabled=True),
+            required_scopes=[],          # any valid token is accepted (allowlisted user)
+        ),
+    )
+
 # Transport hardening for running behind a flaky tunnel:
 #   stateless_http=True  — no long-lived MCP session / server->client SSE stream.
 #       Each tool call is one independent request, so a tunnel reconnect between
@@ -235,7 +284,17 @@ async def _lifespan(_server):
 #   json_response=True   — return each result as a single JSON POST response
 #       instead of an SSE stream, so a reconnect can't truncate a result mid-flight.
 mcp = FastMCP("marketplace-finder", transport_security=_security,
-              lifespan=_lifespan, json_response=True, stateless_http=True)
+              lifespan=_lifespan, json_response=True, stateless_http=True,
+              **_auth_kwargs)
+
+
+if _oauth_provider is not None:
+    @mcp.custom_route("/oauth/google/callback", methods=["GET"])
+    async def _oauth_google_callback(request):
+        q = request.query_params
+        return await _oauth_provider.google_callback(
+            code=q.get("code", ""), state=q.get("state", ""), error=q.get("error"),
+        )
 
 
 @mcp.tool()
@@ -462,11 +521,20 @@ def cmd_serve():
     token = os.environ.get("MCP_AUTH_TOKEN")
 
     app = mcp.streamable_http_app()  # MCP endpoint mounted at /mcp
-    if token:
+    if _oauth_provider is not None:
+        # OAuth is enforced by the SDK's bearer middleware on /mcp; don't also
+        # wrap with _TokenAuth (it would 401 the /authorize, /token, /register
+        # endpoints and break the flow). OAuth takes precedence over any token.
+        print(f"Auth: OAuth 2.1 via Google sign-in (works with claude.ai)")
+        print(f"  allowed emails: {', '.join(sorted(_oauth_provider.allowed_emails))}")
+        print(f"  Google redirect URI: {_oauth_provider.redirect_uri}")
+        if token:
+            print("  note: MCP_AUTH_TOKEN is ignored while OAuth is configured")
+    elif token:
         app = _TokenAuth(app, token)
         print("Auth: requiring Bearer token from MCP_AUTH_TOKEN")
     else:
-        print("Auth: OPEN (no MCP_AUTH_TOKEN set) — keep your tunnel URL private")
+        print("Auth: OPEN (no GOOGLE_CLIENT_ID / MCP_AUTH_TOKEN set) — keep your tunnel URL private")
 
     print(f"Marketplace Finder MCP on http://{host}:{port}/mcp")
     print("Expose it, e.g.:  cloudflared tunnel --url http://localhost:%d" % port)

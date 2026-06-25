@@ -82,20 +82,50 @@ quick-tunnel URL couldn't do this).
 |-----|---------|---------|
 | `MCP_HOST` | `127.0.0.1` | bind address |
 | `MCP_PORT` | `8000` | port |
-| `MCP_AUTH_TOKEN` | _(unset)_ | if set, require `Authorization: Bearer <token>` |
+| `GOOGLE_CLIENT_ID` | _(unset)_ | set it to **lock the server with Google sign-in** (the recommended gate that works with claude.ai). |
+| `GOOGLE_CLIENT_SECRET` | _(unset)_ | the matching Google OAuth client secret |
+| `MCP_ALLOWED_EMAILS` | _(unset)_ | comma-separated allowlist of Google emails permitted to connect |
+| `MCP_PUBLIC_URL` | _(auto)_ | public base URL for OAuth metadata + the Google redirect; derived from your tunnel host when unset |
+| `MCP_AUTH_TOKEN` | _(unset)_ | static `Authorization: Bearer <token>` — works for non-claude.ai clients only (claude.ai sends no custom header). Ignored when OAuth is on. |
 | `MCP_ALLOWED_HOSTS` | _(unset)_ | comma-separated Host allow-list. Unset = DNS-rebinding protection off (needed so a rotating tunnel host isn't rejected with HTTP 421). Set it to pin specific hosts. |
 | `FB_HEADLESS` | `1` | set `0` to watch the browser while serving |
 | `FB_DEFAULT_CITY` | `vancouver` | FB city slug used when a search omits one |
 
-If `MCP_AUTH_TOKEN` is unset the endpoint is open — keep your tunnel URL private,
-or set a token. (claude.ai connectors that support a bearer/OAuth secret can pass it.)
+### Locking it down (recommended)
+
+Without a gate, **anyone who learns your URL can drive your logged-in Facebook
+session.** `./finder install` offers to lock the server to your **Google
+account**. One-time setup in
+[Google Cloud](https://console.cloud.google.com/apis/credentials) — full
+step-by-step (incl. the consent screen) is in **[DEPLOY.md](DEPLOY.md)**:
+
+1. **OAuth consent screen** → User type **External**, then **Publish to
+   Production** (our scopes are non-sensitive, so no Google review). External +
+   Production is what lets friends with any Gmail sign in.
+2. **Credentials → OAuth client ID**, type **Web application**, with the
+   **Authorized redirect URI** exactly `https://<your-host>/oauth/google/callback`.
+3. Run `./finder install`; paste the **Client ID** + **secret** and list the
+   allowed email(s).
+
+claude.ai then shows a Google sign-in when you add the connector; only the
+allowlisted account(s) get in. (Cloudflare Access does **not** work here — it
+breaks claude.ai web; see CLAUDE.md → "Auth".)
+
+**Sharing with friends:** add their Gmail to `MCP_ALLOWED_EMAILS` in `.finder.env`
+and `./finder restart`, then send them the URL — they add it in their own
+claude.ai and sign in. Remove the email + restart to revoke. (Their searches run
+through *your* Facebook session on *your* Mac.) Details in DEPLOY.md → "Adding &
+removing friends".
+
+> First connect shows **"Server not found"**? It's a transient while the OAuth
+> handshake finishes — just refresh. See DEPLOY.md → Troubleshooting.
 
 ## Notes & next steps
 
 - **Facebook city slugs** are short names like `vancouver`, `seattle`, `nyc`,
   `la`, `chicago`. The agent passes one as `city`.
 - **Session expiry:** if Facebook starts showing a login wall, the tool says so
-  — re-run `python server.py login`.
+  — run `./finder login` (re-auths FB, then restarts the service).
 - **Adding marketplaces** (Craigslist, eBay, Kijiji…): add a new `@mcp.tool()`
   in `server.py` that builds that site's search URL and reuses the same
   card-extraction pattern. Craigslist needs no login; it's scraped through the

@@ -10,6 +10,10 @@ __pycache__/
 .env
 .finder.env
 
+# OAuth state: registered clients + issued access/refresh tokens — secrets
+.oauth-store.json
+.oauth-store.tmp
+
 # runtime logs
 *.log
 logs/

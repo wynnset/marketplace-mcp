@@ -49,15 +49,21 @@ CLOUDFLARED="$(command -v cloudflared || true)"
 load_config() { [ -f "$CONFIG" ] && set -a && . "$CONFIG" && set +a || true; }
 
 save_config() {
+  # Note: this file holds your Google client secret — it is gitignored and
+  # readable only by you. Treat it like a password.
   cat > "$CONFIG" <<EOF
 # Written by ./finder install — your permanent endpoint settings.
 FINDER_HOSTNAME="$FINDER_HOSTNAME"
+GOOGLE_CLIENT_ID="${GOOGLE_CLIENT_ID:-}"
+GOOGLE_CLIENT_SECRET="${GOOGLE_CLIENT_SECRET:-}"
+MCP_ALLOWED_EMAILS="${MCP_ALLOWED_EMAILS:-}"
 EOF
+  chmod 600 "$CONFIG" 2>/dev/null || true
 }
 
 # ─── bootstrap: venv + python deps + chromium ─────────────────────────────────
 bootstrap_python() {
-  bold "1/4  Python environment"
+  bold "1/5  Python environment"
   command -v python3 >/dev/null || die "python3 not found. Install Python 3.10+ first."
   if [ ! -x "$PY" ]; then
     python3 -m venv "$VENV"
@@ -79,7 +85,7 @@ bootstrap_python() {
 
 # ─── Facebook login (only if no saved session yet) ────────────────────────────
 ensure_fb_login() {
-  bold "2/4  Facebook session"
+  bold "2/5  Facebook session"
   if [ -d "$REPO/.browser-profile" ]; then
     ok "logged-in browser profile found (re-run './finder login' if FB logs you out)"
     return
@@ -93,7 +99,7 @@ ensure_fb_login() {
 
 # ─── Cloudflare named tunnel (permanent URL) ──────────────────────────────────
 ensure_tunnel() {
-  bold "3/4  Cloudflare tunnel (your permanent URL)"
+  bold "3/5  Cloudflare tunnel (your permanent URL)"
   [ -n "$CLOUDFLARED" ] || die "cloudflared not found. Install it:  brew install cloudflared"
 
   # Hostname: mcp.<your-domain>. Ask once, remember it.
@@ -157,8 +163,47 @@ EOF
   rm -f /tmp/finder-dns.$$
 }
 
+# ─── Google sign-in lockdown (optional but recommended) ───────────────────────
+ensure_oauth() {
+  bold "4/5  Access control (Google sign-in)"
+  if [ -n "${GOOGLE_CLIENT_ID:-}" ] && [ -n "${MCP_ALLOWED_EMAILS:-}" ]; then
+    ok "Google sign-in already configured (emails: $MCP_ALLOWED_EMAILS)"
+    echo "    Re-run with no config to change it, or edit $CONFIG."
+    return
+  fi
+  echo "    Without this, ANYONE who learns your URL can drive your logged-in"
+  echo "    Facebook session. Lock it to your Google account instead (recommended)."
+  echo
+  echo "    One-time Google Cloud setup (https://console.cloud.google.com/apis/credentials):"
+  echo "      • Create an OAuth 2.0 Client ID, type 'Web application'"
+  echo "      • Add this Authorized redirect URI exactly:"
+  echo "            https://$FINDER_HOSTNAME/oauth/google/callback"
+  echo "      • Copy the Client ID and Client secret it gives you"
+  echo
+  read -r -p "    Configure Google sign-in now? [Y/n]: " _ans || true
+  case "${_ans:-Y}" in
+    [Nn]*) warn "skipping — server will run OPEN (secured only by the secret URL)"; return ;;
+  esac
+  read -r -p "    Google Client ID: " GOOGLE_CLIENT_ID
+  read -r -p "    Google Client secret: " GOOGLE_CLIENT_SECRET
+  read -r -p "    Allowed email(s), comma-separated [aidin@wynnset.com]: " MCP_ALLOWED_EMAILS
+  MCP_ALLOWED_EMAILS="${MCP_ALLOWED_EMAILS:-aidin@wynnset.com}"
+  [ -n "$GOOGLE_CLIENT_ID" ] && [ -n "$GOOGLE_CLIENT_SECRET" ] || die "Client ID and secret are required (or answer 'n' to skip)."
+  export GOOGLE_CLIENT_ID GOOGLE_CLIENT_SECRET MCP_ALLOWED_EMAILS
+  save_config
+  ok "Google sign-in configured (emails: $MCP_ALLOWED_EMAILS)"
+}
+
 # ─── launchd services (auto-start at login, self-heal) ────────────────────────
 write_plists() {
+  # Inject the OAuth env vars into the server plist only when configured.
+  local oauth_env=""
+  if [ -n "${GOOGLE_CLIENT_ID:-}" ]; then
+    oauth_env="    <key>GOOGLE_CLIENT_ID</key><string>${GOOGLE_CLIENT_ID}</string>
+    <key>GOOGLE_CLIENT_SECRET</key><string>${GOOGLE_CLIENT_SECRET}</string>
+    <key>MCP_ALLOWED_EMAILS</key><string>${MCP_ALLOWED_EMAILS}</string>
+    <key>MCP_PUBLIC_URL</key><string>https://${FINDER_HOSTNAME}</string>"
+  fi
   mkdir -p "$LA_DIR" "$REPO/logs"
   cat > "$SERVER_PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -178,6 +223,7 @@ write_plists() {
     <key>MCP_PORT</key><string>$PORT</string>
     <key>MCP_ALLOWED_HOSTS</key><string>$FINDER_HOSTNAME</string>
     <key>FB_HEADLESS</key><string>1</string>
+$oauth_env
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -215,7 +261,7 @@ boot_service() {  # bootstrap (load) a plist, replacing any existing instance
 }
 
 install_services() {
-  bold "4/4  Auto-start services"
+  bold "5/5  Auto-start services"
   write_plists
   boot_service "$SERVER_LABEL" "$SERVER_PLIST"
   boot_service "$TUNNEL_LABEL" "$TUNNEL_PLIST"
@@ -242,6 +288,12 @@ cmd_status() {
   # launchd
   if launchctl print "$GUI/$SERVER_LABEL" >/dev/null 2>&1; then ok "server service: loaded"; else warn "server service: not loaded"; fi
   if launchctl print "$GUI/$TUNNEL_LABEL" >/dev/null 2>&1; then ok "tunnel service: loaded"; else warn "tunnel service: not loaded"; fi
+  # access control
+  if [ -n "${GOOGLE_CLIENT_ID:-}" ] && [ -n "${MCP_ALLOWED_EMAILS:-}" ]; then
+    ok "access: Google sign-in (allowed: $MCP_ALLOWED_EMAILS)"
+  else
+    warn "access: OPEN — anyone with the URL can use it. Run ./finder install to add Google sign-in."
+  fi
   # public endpoint
   if [ -n "${FINDER_HOSTNAME:-}" ]; then
     local pub
@@ -288,6 +340,8 @@ cmd_install() {
   ensure_fb_login
   echo
   ensure_tunnel
+  echo
+  ensure_oauth
   echo
   install_services
   echo
