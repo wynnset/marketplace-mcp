@@ -14,7 +14,26 @@
   // SQLite-backed DO classes (required for the free plan).
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["RelayDO"] }
-  ]
+  ],
+
+  // KV: OAUTH_KV is the @cloudflare/workers-oauth-provider grant/client/token store;
+  // RELAY_KV holds our own state (in-flight authorize `state`; Step-3 device-token
+  // revocation denylist). `id` values are placeholders — `wrangler dev` ignores them
+  // and uses a local store; fill real ids (`wrangler kv namespace create`) before
+  // deploying in Step 5.
+  "kv_namespaces": [
+    { "binding": "OAUTH_KV", "id": "REPLACE_WITH_OAUTH_KV_ID" },
+    { "binding": "RELAY_KV", "id": "REPLACE_WITH_RELAY_KV_ID" }
+  ],
+
+  // Non-secret config. PUBLIC_URL is the relay's public base; set it to the real
+  // hostname before deploy. Secrets (GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET,
+  // MCP_ALLOWED_EMAILS, and the Step-3 RELAY_JWT_SECRET) are set via
+  // `wrangler secret put`, never committed. For local dev, put them in
+  // relay/.dev.vars (gitignored).
+  "vars": {
+    "PUBLIC_URL": "http://127.0.0.1:8787"
+  }
 
   // Step 5: route the custom hostname here, e.g.
   // "routes": [{ "pattern": "mcp.wynnset.com", "custom_domain": true }]

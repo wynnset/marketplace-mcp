@@ -1,5 +1,5 @@
 /**
- * marketplace-relay — Cloudflare Worker + Durable Object  (STEP 1 SKELETON)
+ * marketplace-relay — Cloudflare Worker + Durable Object  (STEP 2: OAuth gate)
  *
  * The single public endpoint for every friend's Mac. One URL, no per-friend
  * subdomain: requests are routed to the right Mac by *identity*, not by hostname.
@@ -7,28 +7,59 @@
  *   claude.ai ──POST /mcp──▶ Worker ─▶ DO(identity) ─┐
  *   Alice Mac ──WSS /agent─▶ Worker ─▶ DO(identity) ◀┘ (holds the live socket)
  *
- * A Durable Object instance is created per identity (`idFromName(identity)`); it
- * is the rendezvous point where claude.ai's request meets the Mac's registered
- * WebSocket. Because every MCP tool call is a single JSON response (the Mac runs
- * stateless_http + json_response), the DO is a plain request/response proxy with
- * correlation ids — no streaming to keep alive.
+ * AUTH (Step 2): the claude.ai-facing OAuth authorization server is provided by
+ * `@cloudflare/workers-oauth-provider` — it owns DCR, PKCE, /token, /register,
+ * /revoke, the metadata docs, and the RFC 9728 `WWW-Authenticate` header claude.ai
+ * requires. We supply only the human gate (Google sign-in + email allowlist, in
+ * google_gate.ts) and the API handler that routes an authenticated /mcp request to
+ * `DO(sub)` using the library-verified `ctx.props.sub`. The access token is the
+ * library's own opaque, KV-backed token — NOT a JWT (see docs/RELAY_MIGRATION.md).
  *
- * STEP 1 stubs identity as the `X-Relay-Identity` header. Step 2 issues signed JWT
- * access tokens and Step 3 derives identity from the verified token `sub` (for /mcp)
- * and a signed device-JWT `sub` (for /agent) — same routing, real auth.
+ * The /agent leg still uses the Step-1 `X-Relay-Identity` stub; Step 3 swaps it for
+ * a verified device-JWT (signed with RELAY_JWT_SECRET).
  */
+
+import OAuthProvider, {
+  type AuthRequest,
+  type OAuthHelpers,
+} from "@cloudflare/workers-oauth-provider";
+import {
+  GOOGLE_CALLBACK_PATH,
+  allowedEmails,
+  buildGoogleAuthUrl,
+  denyPage,
+  expiredPage,
+  fetchGoogleEmail,
+} from "./google_gate";
+
+/** Encrypted into the grant by the library; handed back to the API handler as ctx.props. */
+interface Props {
+  sub: string; // verified, lowercased email — the routing key
+}
 
 export interface Env {
   RELAY: DurableObjectNamespace;
+  OAUTH_KV: KVNamespace; // the library's grant/client/token store
+  RELAY_KV: KVNamespace; // our own state (in-flight authorize state; Step-3 denylist)
+  OAUTH_PROVIDER: OAuthHelpers; // helper methods injected by the library
+  GOOGLE_CLIENT_ID: string;
+  GOOGLE_CLIENT_SECRET: string;
+  MCP_ALLOWED_EMAILS: string;
+  PUBLIC_URL: string;
+  GOOGLE_AUTH_URL?: string;
+  GOOGLE_TOKEN_URL?: string;
+  GOOGLE_USERINFO_URL?: string;
 }
 
 const IDENTITY_HEADER = "x-relay-identity";
 const AGENT_TIMEOUT_MS = 30_000;
+const ACCESS_TOKEN_TTL = 60 * 60 * 24; // 1 day, matching the old oauth.py
+const AUTHZ_STATE_PREFIX = "authz_state:";
+const AUTHZ_STATE_TTL = 300; // 5 min — an in-flight authorize request is short-lived
 
-function identityOf(req: Request): string {
-  // STEP 1 stub. Step 3: verify JWT and use its `sub`.
-  return req.headers.get(IDENTITY_HEADER) ?? "default";
-}
+// Headers we never forward down to the Mac: routing/authority framing and the
+// bearer token (the Mac app runs open behind the relay; it has no use for it).
+const STRIP_TO_AGENT = new Set([IDENTITY_HEADER, "authorization"]);
 
 function rpcError(message: string, code: number, httpStatus: number): Response {
   return new Response(
@@ -37,33 +68,110 @@ function rpcError(message: string, code: number, httpStatus: number): Response {
   );
 }
 
-export default {
-  async fetch(req: Request, env: Env): Promise<Response> {
-    const url = new URL(req.url);
+// ── /mcp: authenticated MCP traffic. The library has already validated the bearer
+//    token and decrypted the grant into ctx.props; route to that identity's DO. ────
+const apiHandler = {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const props = (ctx as ExecutionContext & { props?: Props }).props;
+    const sub = props?.sub?.toLowerCase();
+    if (!sub) {
+      // Should never happen — the library only invokes us for valid tokens.
+      return rpcError("token has no identity", -32003, 401);
+    }
+    const id = env.RELAY.idFromName(sub);
+    return env.RELAY.get(id).fetch(request);
+  },
+};
+
+// ── everything that is not /mcp or a library-owned OAuth endpoint ─────────────────
+const defaultHandler = {
+  async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
 
     if (url.pathname === "/healthz") {
       return new Response("ok\n", { headers: { "content-type": "text/plain" } });
     }
 
-    // Mac agent registers here (outbound WebSocket).
+    // Mac agent registers here. STEP 2 still uses the X-Relay-Identity stub;
+    // Step 3 verifies a device-JWT and routes on its `sub`.
     if (url.pathname === "/agent") {
-      if (req.headers.get("Upgrade") !== "websocket") {
+      if (request.headers.get("Upgrade") !== "websocket") {
         return new Response("expected websocket upgrade", { status: 426 });
       }
-      const id = env.RELAY.idFromName(identityOf(req));
-      return env.RELAY.get(id).fetch(req);
+      const identity = (request.headers.get(IDENTITY_HEADER) ?? "default").toLowerCase();
+      const id = env.RELAY.idFromName(identity);
+      return env.RELAY.get(id).fetch(request);
     }
 
-    // claude.ai speaks MCP here. Routed to the same DO as the matching agent.
-    if (url.pathname === "/mcp") {
-      const id = env.RELAY.idFromName(identityOf(req));
-      return env.RELAY.get(id).fetch(req);
+    // /authorize → bounce the browser to Google sign-in (the library advertises this
+    // path in its metadata but delegates the actual login to us).
+    if (url.pathname === "/authorize") {
+      const oauthReq = await env.OAUTH_PROVIDER.parseAuthRequest(request);
+      // Persist the in-flight request keyed by an unguessable state so the Google
+      // round-trip can resume it (mirrors oauth.py's _pending dict).
+      const state = crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "");
+      await env.RELAY_KV.put(AUTHZ_STATE_PREFIX + state, JSON.stringify(oauthReq), {
+        expirationTtl: AUTHZ_STATE_TTL,
+      });
+      return Response.redirect(buildGoogleAuthUrl(env, state), 302);
+    }
+
+    // Google redirect lands here: verify the account, then complete the MCP authorize.
+    if (url.pathname === GOOGLE_CALLBACK_PATH) {
+      const state = url.searchParams.get("state") || "";
+      const code = url.searchParams.get("code") || "";
+      const error = url.searchParams.get("error");
+
+      const stored = state ? await env.RELAY_KV.get(AUTHZ_STATE_PREFIX + state) : null;
+      if (!stored) return expiredPage();
+      await env.RELAY_KV.delete(AUTHZ_STATE_PREFIX + state);
+      const oauthReq = JSON.parse(stored) as AuthRequest;
+
+      if (error || !code) {
+        return denyPage(`Google sign-in was cancelled (${error || "no code"}).`);
+      }
+
+      let email = "";
+      let verified = false;
+      try {
+        ({ email, verified } = await fetchGoogleEmail(env, code));
+      } catch {
+        return denyPage("Could not verify your Google account. Try again.");
+      }
+
+      if (!verified || !allowedEmails(env).has(email.toLowerCase())) {
+        return denyPage(`${email || "This account"} is not authorized for this server.`);
+      }
+
+      const sub = email.toLowerCase();
+      const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+        request: oauthReq,
+        userId: sub,
+        metadata: { email: sub },
+        scope: oauthReq.scope ?? [],
+        props: { sub } satisfies Props,
+      });
+      return Response.redirect(redirectTo, 302);
     }
 
     return new Response("not found", { status: 404 });
   },
 };
 
+export default new OAuthProvider({
+  apiRoute: "/mcp",
+  // The library's handler types are nominal; our plain ExportedHandlers satisfy the
+  // runtime contract (fetch(request, env, ctx) with ctx.props on the API side).
+  apiHandler: apiHandler as never,
+  defaultHandler: defaultHandler as never,
+  authorizeEndpoint: "/authorize",
+  tokenEndpoint: "/token",
+  clientRegistrationEndpoint: "/register",
+  scopesSupported: ["openid", "email", "profile", "mcp"],
+  accessTokenTTL: ACCESS_TOKEN_TTL,
+});
+
+// ── Durable Object: rendezvous between claude.ai's /mcp request and the Mac's WS ──
 interface ResEnvelope {
   t: "res";
   cid: string;
@@ -102,7 +210,7 @@ export class RelayDO {
         cid,
         method: req.method,
         path: "/mcp",
-        headers: [...req.headers].filter(([k]) => k !== IDENTITY_HEADER),
+        headers: [...req.headers].filter(([k]) => !STRIP_TO_AGENT.has(k.toLowerCase())),
         body_b64: b64encode(bodyBuf),
       };
 

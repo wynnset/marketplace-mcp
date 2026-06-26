@@ -21,6 +21,7 @@ logs/
 # relay (Cloudflare Worker) build + local state
 relay/node_modules/
 relay/.wrangler/
+relay/.dev.vars
 node_modules/
 
 # server-side radius filter geocode memo
