@@ -93,7 +93,7 @@ ensure_fb_login() {
   warn "no saved Facebook session — opening a browser to log in"
   echo "    A Chrome window will open. Log into Facebook, then close the window."
   read -r -p "    Press Enter to open the login browser… " _ || true
-  "$PY" "$REPO/server.py" login
+  "$PY" "$REPO/src/server.py" login
   ok "Facebook session saved"
 }
 
@@ -213,7 +213,7 @@ write_plists() {
   <key>ProgramArguments</key>
   <array>
     <string>$PY</string>
-    <string>$REPO/server.py</string>
+    <string>$REPO/src/server.py</string>
     <string>serve</string>
   </array>
   <key>WorkingDirectory</key><string>$REPO</string>
@@ -319,7 +319,7 @@ cmd_login() {
   warn "stopping the server so it releases the browser profile…"
   launchctl bootout "$GUI/$SERVER_LABEL" 2>/dev/null || true
   [ -x "$PY" ] || die "Run ./finder install first."
-  "$PY" "$REPO/server.py" login
+  "$PY" "$REPO/src/server.py" login
   if [ -f "$SERVER_PLIST" ]; then boot_service "$SERVER_LABEL" "$SERVER_PLIST"; ok "server restarted"; fi
 }
 

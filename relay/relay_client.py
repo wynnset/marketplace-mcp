@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""
+relay_client.py — Mac-side reverse tunnel  (STEP 1 SKELETON)
+
+Proves the new transport end to end:
+
+    claude.ai ──HTTPS──▶ Cloudflare Worker ──▶ Durable Object ──WSS──▶ THIS ──▶ back
+
+Instead of accepting inbound HTTP (the old cloudflared model), this process dials
+*outbound* to the relay over a WebSocket and registers. The relay forwards each
+claude.ai HTTP request to /mcp down that socket as a small envelope; we replay it
+into a real in-process FastMCP app and ship the HTTP response back up the socket.
+
+Why this shape: it reuses the exact FastMCP app (stateless_http + json_response)
+with zero MCP-protocol re-implementation — the relay is a pure request/response
+HTTP-over-WebSocket tunnel, which is only possible *because* every tool call is a
+single JSON response (no SSE stream to keep alive). The whole class of cloudflared
+QUIC/SSE drops (CLAUDE.md lesson #3) simply cannot happen here.
+
+STEP 1 is transport-only: the app exposes a single `echo` tool and identity is a
+stub header. Step 3 swaps the stub for a signed device-JWT; step 4 swaps the echo
+app for the real Facebook tools (same app object, same transport).
+
+Env:
+  RELAY_URL       wss://mcp.<domain>/agent   (default ws://127.0.0.1:8787/agent)
+  RELAY_IDENTITY  routing key; step-1 stub   (default "default")
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import logging
+import os
+
+import httpx
+import websockets
+from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
+
+log = logging.getLogger("relay")
+
+RELAY_URL = os.environ.get("RELAY_URL", "ws://127.0.0.1:8787/agent")
+RELAY_IDENTITY = os.environ.get("RELAY_IDENTITY", "default")  # step-1 stub
+RECONNECT_MIN, RECONNECT_MAX = 1, 30
+MAX_FRAME = 16 * 1024 * 1024
+
+# Request headers we must NOT forward verbatim into the in-process app: host (would
+# trip rebinding checks / set a bogus authority) and length/connection framing that
+# httpx recomputes from the body we hand it.
+_SKIP_REQ_HEADERS = {"host", "content-length", "connection", "x-relay-identity"}
+
+
+# ── the MCP app (skeleton: a single echo tool) ─────────────────────────────────
+# DNS-rebinding protection is OFF here on purpose: there is no public host to pin —
+# the Worker terminates claude.ai's TLS/Host and owns that check (CLAUDE.md #1).
+mcp = FastMCP(
+    "marketplace-finder-skeleton",
+    json_response=True,
+    stateless_http=True,
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+)
+
+
+@mcp.tool()
+def echo(text: str) -> str:
+    """Echo the text back — a transport sanity check for the relay skeleton."""
+    return f"echo: {text}"
+
+
+app = mcp.streamable_http_app()
+
+
+# ── dispatch one forwarded HTTP request into the app, return a response envelope ─
+async def _dispatch(client: httpx.AsyncClient, env: dict) -> dict:
+    body = base64.b64decode(env.get("body_b64") or "")
+    headers = {
+        k: v for k, v in (env.get("headers") or [])
+        if k.lower() not in _SKIP_REQ_HEADERS
+    }
+    r = await client.request(env["method"], env["path"], headers=headers, content=body)
+    return {
+        "t": "res",
+        "cid": env["cid"],
+        "status": r.status_code,
+        # Only content-type matters to claude.ai for JSON responses; forwarding the
+        # rest (content-length, encoding) risks mismatching the bytes we send.
+        "headers": [["content-type", r.headers.get("content-type", "application/json")]],
+        "body_b64": base64.b64encode(r.content).decode(),
+    }
+
+
+async def _serve_connection(client: httpx.AsyncClient) -> None:
+    async with websockets.connect(
+        RELAY_URL,
+        additional_headers={"X-Relay-Identity": RELAY_IDENTITY},
+        max_size=MAX_FRAME,
+        ping_interval=20,
+        ping_timeout=20,
+    ) as ws:
+        log.info("registered with relay %s as %r", RELAY_URL, RELAY_IDENTITY)
+        send_q: asyncio.Queue[str] = asyncio.Queue()
+
+        async def writer() -> None:  # single writer → safe concurrent sends
+            while True:
+                await ws.send(await send_q.get())
+
+        async def handle(env: dict) -> None:
+            try:
+                res = await _dispatch(client, env)
+            except Exception as e:  # never let one request kill the connection
+                log.exception("dispatch failed for cid=%s", env.get("cid"))
+                res = {
+                    "t": "res", "cid": env.get("cid"), "status": 502,
+                    "headers": [["content-type", "application/json"]],
+                    "body_b64": base64.b64encode(
+                        json.dumps({"error": str(e)}).encode()).decode(),
+                }
+            await send_q.put(json.dumps(res))
+
+        writer_task = asyncio.create_task(writer())
+        try:
+            async for raw in ws:
+                try:
+                    env = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if env.get("t") == "req":
+                    asyncio.create_task(handle(env))
+        finally:
+            writer_task.cancel()
+
+
+async def main() -> None:
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    backoff = RECONNECT_MIN
+    # Hold the app lifespan + httpx client open across reconnects so the MCP session
+    # manager (and, later, the pre-warmed browser) stays warm — CLAUDE.md lesson #2.
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://relay") as client:
+            while True:
+                try:
+                    await _serve_connection(client)
+                    backoff = RECONNECT_MIN
+                except Exception as e:
+                    log.warning("relay connection lost (%s); reconnecting in %ss", e, backoff)
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, RECONNECT_MAX)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

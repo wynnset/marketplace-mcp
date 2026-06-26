@@ -34,7 +34,7 @@ before it calls a tool — the tools just declare parameters.
 
 ## Setup — one command
 
-> **Want the step-by-step + troubleshooting?** See **[DEPLOY.md](DEPLOY.md)**.
+> **Want the step-by-step + troubleshooting?** See **[DEPLOY.md](docs/DEPLOY.md)**.
 
 ```bash
 brew install cloudflared          # if you don't have it yet
@@ -97,7 +97,7 @@ Without a gate, **anyone who learns your URL can drive your logged-in Facebook
 session.** `./finder install` offers to lock the server to your **Google
 account**. One-time setup in
 [Google Cloud](https://console.cloud.google.com/apis/credentials) — full
-step-by-step (incl. the consent screen) is in **[DEPLOY.md](DEPLOY.md)**:
+step-by-step (incl. the consent screen) is in **[DEPLOY.md](docs/DEPLOY.md)**:
 
 1. **OAuth consent screen** → User type **External**, then **Publish to
    Production** (our scopes are non-sensitive, so no Google review). External +
@@ -114,11 +114,11 @@ breaks claude.ai web; see CLAUDE.md → "Auth".)
 **Sharing with friends:** add their Gmail to `MCP_ALLOWED_EMAILS` in `.finder.env`
 and `./finder restart`, then send them the URL — they add it in their own
 claude.ai and sign in. Remove the email + restart to revoke. (Their searches run
-through *your* Facebook session on *your* Mac.) Details in DEPLOY.md → "Adding &
-removing friends".
+through *your* Facebook session on *your* Mac.) Details in docs/DEPLOY.md →
+"Adding & removing friends".
 
 > First connect shows **"Server not found"**? It's a transient while the OAuth
-> handshake finishes — just refresh. See DEPLOY.md → Troubleshooting.
+> handshake finishes — just refresh. See docs/DEPLOY.md → Troubleshooting.
 
 ## Notes & next steps
 
@@ -127,7 +127,7 @@ removing friends".
 - **Session expiry:** if Facebook starts showing a login wall, the tool says so
   — run `./finder login` (re-auths FB, then restarts the service).
 - **Adding marketplaces** (Craigslist, eBay, Kijiji…): add a new `@mcp.tool()`
-  in `server.py` that builds that site's search URL and reuses the same
+  in `src/server.py` that builds that site's search URL and reuses the same
   card-extraction pattern. Craigslist needs no login; it's scraped through the
   same real browser because it blocks datacenter IPs.
 - **Clarifying questions** are handled by the agent today. If you later want the

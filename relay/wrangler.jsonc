@@ -1,0 +1,21 @@
+{
+  // marketplace-relay — one URL for every friend's Mac (see src/index.ts).
+  // Deploy:  cd relay && npx wrangler deploy
+  // Dev:     cd relay && npx wrangler dev --port 8787
+  "name": "marketplace-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-06-01",
+  "observability": { "enabled": true },
+
+  "durable_objects": {
+    "bindings": [{ "name": "RELAY", "class_name": "RelayDO" }]
+  },
+
+  // SQLite-backed DO classes (required for the free plan).
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["RelayDO"] }
+  ]
+
+  // Step 5: route the custom hostname here, e.g.
+  // "routes": [{ "pattern": "mcp.wynnset.com", "custom_domain": true }]
+}

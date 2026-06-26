@@ -34,14 +34,24 @@ claude.ai ──HTTPS──▶ cloudflared tunnel ──▶ local MCP server (th
 
 ## Files
 
+Layout: the importable app lives in **`src/`** (run as `python src/server.py`);
+dev/build helpers in **`scripts/`**; long-form docs in **`docs/`**; the WIP
+reverse-tunnel transport in **`relay/`**. `finder` stays at the repo root (it's
+the entry point) and runtime data (`.browser-profile/`, `.oauth-store.json`,
+`server.log`, `.geocode-cache.json`, `logs/`, `.venv/`) lives at the root too —
+`src/server.py` resolves `ROOT` to its parent so these paths are unchanged.
+
 | File | Purpose |
 |---|---|
-| `finder` | **bash CLI** that installs/runs/manages everything: deps, FB login, the permanent Cloudflare named tunnel, and the launchd auto-start services. Start here for anything operational. |
-| `server.py` | Everything else: FastMCP server, the two tools, and the `login` CLI. Wires in the OAuth gate when `GOOGLE_CLIENT_ID` is set. |
-| `oauth.py` | The OAuth 2.1 authorization-server gate, fronted by **Google sign-in** (email allowlist). Only loaded when OAuth is configured. See "Auth" below. |
-| `requirements.txt` | `mcp`, `playwright`, `uvicorn`, `httpx` (httpx is for the Google token exchange). |
+| `finder` | **bash CLI** (repo root) that installs/runs/manages everything: deps, FB login, the permanent Cloudflare named tunnel, and the launchd auto-start services. Start here for anything operational. |
+| `src/server.py` | Everything else: FastMCP server, the two tools, and the `login` CLI. Wires in the OAuth gate when `GOOGLE_CLIENT_ID` is set. |
+| `src/oauth.py` | The OAuth 2.1 authorization-server gate, fronted by **Google sign-in** (email allowlist). Only loaded when OAuth is configured. See "Auth" below. |
+| `src/gazetteer.py` | **Generated** offline city→(lat,lng) table (~1500: top 1000 US + top 500 CA by population) for the server-side radius filter. Keyed by accent-stripped, `St.`→`Saint`-normalized city name. Committed (it's data). |
+| `scripts/build_gaz.py` | Regenerates `src/gazetteer.py` from the GeoNames `cities1000` dump (public domain). Re-run if you want more/different cities. |
+| `scripts/mock_relay.py`, `scripts/test_echo.py` | Offline test harness for the `relay/` transport. |
+| `requirements.txt` | `mcp`, `playwright`, `uvicorn`, `httpx` (httpx is for the Google token exchange + Nominatim geocoding). |
 | `README.md` | Short overview + setup. |
-| `DEPLOY.md` | Full step-by-step deploy/use walkthrough + troubleshooting. |
+| `docs/DEPLOY.md` | Full step-by-step deploy/use walkthrough + troubleshooting. |
 | `.browser-profile/` | **gitignored** — the logged-in FB session. Never commit. |
 | `.finder.env` | **gitignored** — tunnel hostname + Google OAuth client id/secret/emails (chmod 600). |
 | `.oauth-store.json` | **gitignored** — persisted OAuth clients + issued access/refresh tokens (chmod 600), so a server restart doesn't force a claude.ai reconnect. |
@@ -58,7 +68,7 @@ needed) → **named Cloudflare tunnel** routed to `mcp.<domain>` (permanent URL)
 `url`, `uninstall`.
 
 Two LaunchAgents live in `~/Library/LaunchAgents`:
-`com.wynnset.finder.server` (runs `.venv/bin/python server.py serve`) and
+`com.wynnset.finder.server` (runs `.venv/bin/python src/server.py serve`) and
 `com.wynnset.finder.tunnel` (runs `cloudflared tunnel --config
 ~/.cloudflared/marketplace-mcp.yml run`). Both `KeepAlive` + `RunAtLoad`; the CLI
 controls them via `launchctl bootstrap/bootout gui/$(id -u) …`.
@@ -71,23 +81,26 @@ rotated, which is why protection had to be off (see lesson #1 below).
 ## Tools
 
 - **`search_facebook_marketplace(query, city, min_price, max_price, radius_km,
-  days_listed, sort, max_results, offset)`** → `{query, search_url, offset,
-  count, has_more, next_offset, hint, listings[]}`.
+  near, min_bedrooms, days_listed, sort, max_results, offset)`** → `{query,
+  search_url, offset, count, has_more, next_offset, hint, listings[]}`.
+  - `radius_km` is enforced via picker + distance filter, NOT the URL (lesson #5);
+    `near` centres it on a neighbourhood/landmark; `min_bedrooms` filters cards.
   - Scrapes listing **cards straight off the search results page** (no per-item
     navigation) — fast (~4–5s server-side).
   - **Pagination**: infinite-scroll feed. Pass `offset` to page; the response's
     `has_more`/`next_offset`/`hint` tell the agent to call again for more.
-  - Each listing: `{title, price, location, url, photo, raw_text}`. `raw_text`
-    (trimmed to 300 chars) is always included so the agent can recover anything
-    the heuristic parse missed.
+  - Each listing: `{title, price, location, bedrooms, bathrooms, property_type,
+    area_sqft, url, photo, raw_text}`. The structured fields may be null;
+    `raw_text` (trimmed to 300 chars) is always included so the agent can recover
+    anything the heuristic parse missed.
 - **`get_listing_details(url)`** → full description/condition for one item.
 
 ## Commands
 
-- `python server.py login` — one-time interactive (headed) FB login. **Stop the
-  server first** — `login` and `serve` both use `.browser-profile/` and can't run
-  at once.
-- `python server.py serve` — run the MCP server (default command).
+- `python src/server.py login` — one-time interactive (headed) FB login. **Stop
+  the server first** — `login` and `serve` both use `.browser-profile/` and can't
+  run at once.
+- `python src/server.py serve` — run the MCP server (default command).
 
 ## Config (env vars, all optional)
 
@@ -104,14 +117,14 @@ allowlist) · `MCP_PUBLIC_URL` (public base URL; auto-derived from
 ## Run / deploy
 
 ```bash
-python server.py serve
+python src/server.py serve
 cloudflared tunnel --protocol http2 --url http://localhost:8000   # note: http2!
 # add https://<tunnel-host>/mcp as a claude.ai custom connector
 ```
 
 Quick-tunnel URLs **rotate on every restart** → re-paste into claude.ai each time.
 For a permanent URL, use a named Cloudflare tunnel + your own domain (see
-DEPLOY.md → "Stable URL").
+docs/DEPLOY.md → "Stable URL").
 
 ---
 
@@ -123,7 +136,7 @@ transport problems, not server/Facebook problems.** Confirm the server side firs
 fine and the issue is the tunnel/transport. claude.ai's own error messages blamed
 "login walls / CAPTCHA" and these were **wrong** every time.
 
-The four fixes, all currently in `server.py` / the run command — do **not** regress them:
+The four fixes, all currently in `src/server.py` / the run command — do **not** regress them:
 
 1. **DNS-rebinding protection → HTTP 421.** The MCP SDK only trusts `localhost`
    by default and rejects the tunnel's `Host` header with 421. Fixed via
@@ -149,6 +162,32 @@ The four fixes, all currently in `server.py` / the run command — do **not** re
    `og:image` is often blank on FB → fall back to `alt="Photo of…"` images, then
    the largest `fbcdn.net` image. Expect to tweak `_parse_card` / `SEARCH_CARDS_JS`
    when FB changes their markup.
+
+5. **FB ignores `radius` / `latitude` / `longitude` in the search URL.** Setting
+   `&radius=5` does nothing — results span the account's *saved* picker radius
+   (was 72 km here → whole Lower Mainland). Proven: `radius=2` vs `radius=100`
+   returned the same spread; URL lat/lng returned the account's home city
+   (Montréal) instead. So `radius_km` is enforced two ways, neither via URL:
+   - **`_set_search_location()`** drives FB's "Change location" dialog (the only
+     state FB honours). Setting **both** the location combobox (accepts a
+     neighbourhood/landmark via `near`) **and** the radius combobox is what makes
+     FB actually tighten — radius-alone stays loose. Side effect: this changes
+     the account's global Marketplace location. Fragile (custom comboboxes) →
+     best-effort, wrapped in try/except.
+   - **server-side distance filter** (`_geocode` + `_haversine_km`) is the
+     deterministic backstop. Lookup order: curated `_GAZETTEER` (Metro Van) →
+     `gazetteer.py` (~1500 NA cities) → disk cache (`.geocode-cache.json`) →
+     Nominatim. Nominatim is throttled to ≤1 req/sec with a contact email
+     (`GEOCODE_CONTACT_EMAIL`, per its usage policy) and is rarely hit because
+     the gazetteers cover most card cities offline. **City-level granularity
+     only**: it drops other cities (Surrey/Abbotsford…) but can't resolve
+     sub-city distance — card `location` is just a city name. Applied *before*
+     pagination so pages stay coherent; pulls a deeper card pool when filtering.
+     Ungeocodable listings are kept, not dropped.
+
+   Cards also carry `bedrooms`/`bathrooms`/`property_type` (and sometimes
+   `area_sqft`) — parsed in `_parse_card`; `min_bedrooms` filters on them. sqft is
+   usually only on the item page (`get_listing_details`).
 
 ## Verifying changes WITHOUT claude.ai
 
@@ -184,7 +223,7 @@ URL. The public path was validated separately and works.
 ## Auth (how the server is locked down)
 
 The endpoint is open unless `GOOGLE_CLIENT_ID` is set; `./finder install` walks
-you through turning it on. When on, **`oauth.py` runs a minimal OAuth 2.1
+you through turning it on. When on, **`src/oauth.py` runs a minimal OAuth 2.1
 authorization server *inside* this MCP server**, and the human gate is **Google
 sign-in restricted to `MCP_ALLOWED_EMAILS`**. Flow:
 
@@ -195,7 +234,7 @@ claude.ai ──/authorize──▶ this server ──redirect──▶ Google s
 
 The MCP SDK (`auth_server_provider=` + `AuthSettings`) provides the
 /authorize·/token·/register·/revoke endpoints, PKCE verification, and the
-metadata docs; `oauth.py` supplies storage + the Google email gate. Tokens +
+metadata docs; `src/oauth.py` supplies storage + the Google email gate. Tokens +
 DCR clients persist to `.oauth-store.json` so launchd restarts don't force a
 reconnect.
 
@@ -212,7 +251,7 @@ reconnect.
   401 from `/mcp` still carries `WWW-Authenticate` with `resource_metadata`.
 - Google's `redirect_uri` (`https://<host>/oauth/google/callback`) must match
   the one registered in the Google Cloud OAuth client **exactly**, and is built
-  once in `oauth.py` (`self.redirect_uri`) for both the authorize and token legs.
+  once in `src/oauth.py` (`self.redirect_uri`) for both the authorize and token legs.
 
 ## Gotchas / future work (auth)
 

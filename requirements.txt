@@ -2,3 +2,4 @@ mcp>=1.9
 playwright>=1.44
 uvicorn>=0.30
 httpx>=0.27          # Google token exchange in the OAuth gate (oauth.py)
+websockets>=13       # Mac-side outbound WebSocket to the relay (relay_client.py)

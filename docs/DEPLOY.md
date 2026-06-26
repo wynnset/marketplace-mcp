@@ -210,7 +210,7 @@ live service actually runs with `./finder status`.
 | claude.ai can't connect | Is the public endpoint reachable in `./finder status`? Did you include `/mcp`? |
 | "browser not found" / Playwright error | `.venv/bin/python -m playwright install chromium`. |
 | Connector option missing in claude.ai | Custom connectors require a paid plan. |
-| Want to watch the browser work | It runs headless as a service. To watch, `./finder stop` then `FB_HEADLESS=0 .venv/bin/python server.py serve` in a terminal. |
+| Want to watch the browser work | It runs headless as a service. To watch, `./finder stop` then `FB_HEADLESS=0 .venv/bin/python src/server.py serve` in a terminal. |
 | Zero results but you expect some | Try a different `city` slug, widen the price range, or set `sort: newest`. |
 
 ---
@@ -224,7 +224,7 @@ If you'd rather run things by hand (or debug), the pieces underneath are:
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 python -m playwright install chromium
-python server.py login
+python src/server.py login
 
 # permanent named tunnel (one-time)
 cloudflared tunnel login
@@ -233,7 +233,7 @@ cloudflared tunnel route dns marketplace-mcp mcp.yourdomain.com
 # write ~/.cloudflared/marketplace-mcp.yml pointing the hostname at http://localhost:8000
 
 # run (two processes)
-MCP_ALLOWED_HOSTS=mcp.yourdomain.com python server.py serve
+MCP_ALLOWED_HOSTS=mcp.yourdomain.com python src/server.py serve
 cloudflared tunnel --config ~/.cloudflared/marketplace-mcp.yml run
 ```
 

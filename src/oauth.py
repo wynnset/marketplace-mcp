@@ -157,7 +157,7 @@ class GoogleOAuthProvider(OAuthAuthorizationServerProvider):
         })
         return google_url
 
-    # ── Google redirect lands here (custom route in server.py) ─────────────
+    # ── Google redirect lands here (custom route in src/server.py) ─────────
     async def google_callback(self, *, code: str, state: str, error: str | None) -> Response:
         entry = self._pending.pop(state, None)
         if entry is None:
