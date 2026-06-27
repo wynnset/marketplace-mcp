@@ -17,6 +17,7 @@
 #   ./finder logs         tail the server + tunnel logs
 #   ./finder url          print the claude.ai connector URL
 #   ./finder login        re-log into Facebook (when the session expires)
+#   ./finder provision <email>   mint a friend's relay device token + bundle (relay model)
 #   ./finder uninstall    remove the auto-start services (keeps your code/login)
 #
 set -euo pipefail
@@ -323,6 +324,53 @@ cmd_login() {
   if [ -f "$SERVER_PLIST" ]; then boot_service "$SERVER_LABEL" "$SERVER_PLIST"; ok "server restarted"; fi
 }
 
+# ─── Step 5: provision a friend's device token (single-relay model) ───────────
+# Additive and non-destructive: this does NOT touch the existing cloudflared
+# tunnel / launchd flow. It mints an HS256 device token (src/devtoken.py) that the
+# relay Worker verifies on /agent, and writes a per-friend bundle the installer
+# ships. Requires RELAY_JWT_SECRET (shared with the Worker) and RELAY_URL in
+# .finder.env. The Worker deploy + cloudflared removal are separate (gated) steps.
+PROVISION_DIR="$REPO/.provision"
+
+cmd_provision() {
+  load_config
+  local email="${1:-}"
+  [ -n "$email" ] || die "usage: ./finder provision <email>"
+  email="$(printf '%s' "$email" | tr '[:upper:]' '[:lower:]')"
+  [ -n "${RELAY_JWT_SECRET:-}" ] || die "RELAY_JWT_SECRET not set — add it to $CONFIG (the secret shared with the relay Worker)."
+  local relay_url="${RELAY_URL:-}"
+  if [ -z "$relay_url" ] && [ -n "${FINDER_HOSTNAME:-}" ]; then
+    relay_url="wss://$FINDER_HOSTNAME/agent"
+  fi
+  [ -n "$relay_url" ] || die "RELAY_URL not set — add it to $CONFIG (e.g. wss://mcp.wynnset.com/agent)."
+  [ -x "$PY" ] || die "No .venv yet — run ./finder install first."
+
+  local token
+  token="$(RELAY_JWT_SECRET="$RELAY_JWT_SECRET" "$PY" "$REPO/src/devtoken.py" "$email")" \
+    || die "could not mint device token (is RELAY_JWT_SECRET set?)"
+
+  mkdir -p "$PROVISION_DIR"
+  local safe bundle
+  safe="$(printf '%s' "$email" | tr -c 'a-z0-9' '_')"
+  bundle="$PROVISION_DIR/$safe.env"
+  cat > "$bundle" <<EOF
+# Device credentials for $email — relay reverse-tunnel client.
+# SECRET: treat like a password. The friend's Mac reads these to dial the relay.
+RELAY_URL="$relay_url"
+RELAY_DEVICE_TOKEN="$token"
+EOF
+  chmod 600 "$bundle" 2>/dev/null || true
+
+  ok "provisioned $email"
+  echo "    bundle: $bundle"
+  echo "    relay : $relay_url"
+  echo
+  warn "two things still needed:"
+  echo "    1. Add '$email' to the relay Worker allowlist (MCP_ALLOWED_EMAILS) — it"
+  echo "       must match the email they sign into Google with, exactly."
+  echo "    2. Ship this bundle inside their installer (Step 5 packaging)."
+}
+
 cmd_uninstall() {
   bold "Removing auto-start services"
   svc_stop
@@ -368,6 +416,7 @@ case "${1:-}" in
   url)       cmd_url ;;
   logs)      cmd_logs ;;
   login)     cmd_login ;;
+  provision) cmd_provision "${2:-}" ;;
   uninstall) cmd_uninstall ;;
   ""|-h|--help|help) usage ;;
   *) err "unknown command: $1"; echo; usage; exit 1 ;;
