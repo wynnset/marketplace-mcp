@@ -38,7 +38,7 @@ from test_oauth import (  # noqa: E402  (reuse the Step-2 OAuth helpers + device
     STUB_PORT,
     _wait_port,
     device_jwt,
-    echo_with_token,
+    reach_relay_tools,
     register_client,
     run_flow,
 )
@@ -152,10 +152,10 @@ async def run_checks() -> int:
     # 2. valid device-JWT registers and routes /mcp to that identity (alice → alice).
     agent = await start_agent(alice_dev)
     try:
-        await echo_with_token(alice_access)
+        await reach_relay_tools(alice_access)
     finally:
         await stop(agent)
-    print("  ✓ valid device-JWT registers; alice's access token reaches alice's agent")
+    print("  ✓ valid device-JWT registers; alice's access token reaches alice's agent (real FB tools)")
 
     # 3. ISOLATION: only bob's agent is connected → alice's access token gets no agent.
     bob_dev = device_jwt(BOB_EMAIL, jti="bob-jti-1")

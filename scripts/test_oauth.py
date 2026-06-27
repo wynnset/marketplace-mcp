@@ -169,17 +169,23 @@ async def run_flow(c: httpx.AsyncClient, client_id: str, google_code: str) -> di
     return {"token": body["access_token"]}
 
 
-async def echo_with_token(token: str) -> None:
+EXPECTED_TOOLS = {"search_facebook_marketplace", "get_listing_details"}
+
+
+async def reach_relay_tools(token: str) -> list[str]:
+    """Initialize an MCP session through the relay and return the advertised tools.
+
+    A full initialize + tools/list round-trips claude.ai → Worker → DO → Mac → back,
+    proving the authenticated transport and that the real Facebook app is being served
+    — without needing a logged-in browser (the actual search is the user's Mac to run).
+    """
     headers = {"Authorization": f"Bearer {token}"}
     async with streamablehttp_client(f"{RELAY_HTTP}/mcp", headers=headers) as (r, w, _):
         async with ClientSession(r, w) as s:
             await s.initialize()
             names = [t.name for t in (await s.list_tools()).tools]
-            assert "echo" in names, f"echo not advertised: {names}"
-            res = await s.call_tool("echo", {"text": "oauth works"})
-            text = res.content[0].text
-            assert text == "echo: oauth works", f"unexpected echo: {text!r}"
-    print("  ✓ opaque access token reaches the echo tool through the relay")
+    assert EXPECTED_TOOLS.issubset(set(names)), f"relay did not advertise the FB tools: {names}"
+    return names
 
 
 async def run_checks() -> int:
@@ -190,7 +196,9 @@ async def run_checks() -> int:
 
         allowed = await run_flow(c, client_id, "code-allowed")
         assert "token" in allowed, f"allowlisted sign-in did not yield a token: {allowed}"
-        await echo_with_token(allowed["token"])
+        names = await reach_relay_tools(allowed["token"])
+        print(f"  ✓ opaque access token reaches the real FB app through the relay "
+              f"(tools: {sorted(names)})")
 
         denied = await run_flow(c, client_id, "code-denied")
         assert denied.get("denied") == 403, f"non-allowlisted email not denied: {denied}"
@@ -202,7 +210,7 @@ async def run_checks() -> int:
         print("  ✓ unverified email denied at callback (no token)")
 
     print("\n✅ PASS — Step 2 OAuth gate: discovery, 401+WWW-Authenticate, "
-          "Google allowlist, opaque token → echo")
+          "Google allowlist, opaque token → real FB app")
     return 0
 
 

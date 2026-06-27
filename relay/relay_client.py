@@ -36,11 +36,10 @@ import base64
 import json
 import logging
 import os
+import sys
 
 import httpx
 import websockets
-from mcp.server.fastmcp import FastMCP
-from mcp.server.transport_security import TransportSecuritySettings
 
 log = logging.getLogger("relay")
 
@@ -56,24 +55,24 @@ MAX_FRAME = 16 * 1024 * 1024
 _SKIP_REQ_HEADERS = {"host", "content-length", "connection", "x-relay-identity"}
 
 
-# ── the MCP app (skeleton: a single echo tool) ─────────────────────────────────
-# DNS-rebinding protection is OFF here on purpose: there is no public host to pin —
-# the Worker terminates claude.ai's TLS/Host and owns that check (CLAUDE.md #1).
-mcp = FastMCP(
-    "marketplace-finder-skeleton",
-    json_response=True,
-    stateless_http=True,
-    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
-)
+# ── the MCP app: the REAL Facebook tools from src/server.py ────────────────────
+# Serve the same FastMCP app the standalone server exposes — search_facebook_
+# marketplace + get_listing_details, with the Chromium pre-warm lifespan — over
+# the reverse tunnel, with zero MCP-protocol re-implementation. It still runs
+# stateless_http + json_response (so the relay stays a pure request/response
+# proxy) and with DNS-rebinding protection OFF: there is no public host to pin
+# here — the Worker terminates claude.ai's TLS/Host and owns that check.
+#
+# On the Mac this app runs OPEN: the relay Worker is the authenticated boundary
+# (Google OAuth + per-identity routing), so we clear any local auth/host gate
+# before importing server.py to guarantee no second gate activates here.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+for _gate in ("GOOGLE_CLIENT_ID", "MCP_ALLOWED_HOSTS", "MCP_AUTH_TOKEN"):
+    os.environ.pop(_gate, None)
 
+import server  # noqa: E402  (src/server.py — added to sys.path just above)
 
-@mcp.tool()
-def echo(text: str) -> str:
-    """Echo the text back — a transport sanity check for the relay skeleton."""
-    return f"echo: {text}"
-
-
-app = mcp.streamable_http_app()
+app = server.app
 
 
 # ── dispatch one forwarded HTTP request into the app, return a response envelope ─

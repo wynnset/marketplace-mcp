@@ -741,6 +741,21 @@ async def get_listing_details(url: str) -> dict:
     }
 
 
+# ─── the built ASGI app (MCP mounted at /mcp) ─────────────────────────────────
+# Exposed at module level (not just inside cmd_serve) so the reverse-tunnel relay
+# client — relay/relay_client.py — can serve this exact app over its WebSocket
+# without starting uvicorn. Building the Starlette app here is cheap and has no
+# side effects (the session manager + browser pre-warm only start when the
+# lifespan is entered, which the relay client does and holds open across
+# reconnects — CLAUDE.md lesson #2).
+#
+# On the Mac, behind the relay, this app runs OPEN: the relay Worker is the
+# authenticated boundary (Google OAuth + per-identity routing), so there is no
+# second gate here. OAuth only activates in legacy standalone use, when
+# GOOGLE_CLIENT_ID is set; the relay client clears it before importing this.
+app = mcp.streamable_http_app()
+
+
 # ─── login (one-time, interactive, headed) ────────────────────────────────────
 def cmd_login():
     from playwright.sync_api import sync_playwright
@@ -790,7 +805,7 @@ def cmd_serve():
     port = int(os.environ.get("MCP_PORT", "8000"))
     token = os.environ.get("MCP_AUTH_TOKEN")
 
-    app = mcp.streamable_http_app()  # MCP endpoint mounted at /mcp
+    served_app = app  # the module-level ASGI app (MCP endpoint mounted at /mcp)
     if _oauth_provider is not None:
         # OAuth is enforced by the SDK's bearer middleware on /mcp; don't also
         # wrap with _TokenAuth (it would 401 the /authorize, /token, /register
@@ -801,14 +816,14 @@ def cmd_serve():
         if token:
             print("  note: MCP_AUTH_TOKEN is ignored while OAuth is configured")
     elif token:
-        app = _TokenAuth(app, token)
+        served_app = _TokenAuth(app, token)
         print("Auth: requiring Bearer token from MCP_AUTH_TOKEN")
     else:
         print("Auth: OPEN (no GOOGLE_CLIENT_ID / MCP_AUTH_TOKEN set) — keep your tunnel URL private")
 
     print(f"Marketplace Finder MCP on http://{host}:{port}/mcp")
     print("Expose it, e.g.:  cloudflared tunnel --url http://localhost:%d" % port)
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run(served_app, host=host, port=port)
 
 
 def main():

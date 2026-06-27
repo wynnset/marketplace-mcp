@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-test_echo.py — end-to-end proof of the STEP 1 relay transport.
+test_echo.py — end-to-end proof of the relay transport (no auth; mock relay).
 
 Drives the official MCP streamable-HTTP client against the relay's /mcp endpoint
-(default: the local mock_relay) and asserts the `echo` tool round-trips through:
+(default: the local mock_relay) and asserts the real Facebook tools are advertised
+through the reverse tunnel (Step 4 swapped the Step-1 echo tool for the real app):
 
-    this client → relay → /agent WebSocket → relay_client.py → FastMCP echo → back
+    this client → relay → /agent WebSocket → relay_client.py → FastMCP app → back
 
 By default it boots the mock relay + relay_client itself, so `python scripts/
 test_echo.py` is a single self-contained check. Point it at a real Worker with:
@@ -49,13 +50,11 @@ async def run_client() -> int:
             tools = await s.list_tools()
             names = [t.name for t in tools.tools]
             print(f"  tools/list → {names}")
-            assert "echo" in names, "echo tool not advertised through the relay"
-
-            res = await s.call_tool("echo", {"text": "relay works"})
-            text = res.content[0].text
-            print(f"  tools/call echo → {text!r}")
-            assert text == "echo: relay works", f"unexpected echo result: {text!r}"
-    print("\n✅ PASS — claude.ai → relay → DO/agent → Mac → echo round-trips")
+            # Step 4: the relay client now serves the real Facebook app, so the
+            # transport proof is that those tools round-trip through the relay.
+            assert "search_facebook_marketplace" in names, \
+                "Facebook tools not advertised through the relay"
+    print("\n✅ PASS — claude.ai → relay → DO/agent → Mac → tools/list round-trips")
     return 0
 
 
