@@ -27,6 +27,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import hmac
+import json
 import os
 import secrets
 import sys
@@ -41,6 +43,32 @@ RELAY_WS = os.environ.get("RELAY_WS", "ws://127.0.0.1:8787/agent")
 STUB_PORT = 8799
 ALLOWED_EMAIL = "alice@example.com"          # must match relay/.dev.vars allowlist
 CLIENT_REDIRECT = "http://127.0.0.1:9999/cb"  # never actually fetched
+# Device-JWT signing — must match relay/.dev.vars RELAY_JWT_SECRET. Mirrors what
+# `finder provision` will mint (Step 5). Shared with scripts/test_identity.py.
+DEVICE_SECRET = os.environ.get("RELAY_JWT_SECRET", "test-relay-jwt-secret-do-not-use-in-prod")
+
+
+def _b64url(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+
+def device_jwt(sub: str, *, aud: str = "relay-agent", secret: str = DEVICE_SECRET,
+               exp: int | None = None, jti: str | None = None, alg: str = "HS256") -> str:
+    """Mint an HS256 device token for the /agent leg (no PyJWT dependency)."""
+    header = {"alg": alg, "typ": "JWT"}
+    payload: dict = {"sub": sub, "aud": aud}
+    if exp is not None:
+        payload["exp"] = exp
+    if jti is not None:
+        payload["jti"] = jti
+    signing_input = (
+        f"{_b64url(json.dumps(header, separators=(',', ':')).encode())}."
+        f"{_b64url(json.dumps(payload, separators=(',', ':')).encode())}"
+    )
+    if alg == "none":
+        return signing_input + "."
+    sig = hmac.new(secret.encode(), signing_input.encode(), hashlib.sha256).digest()
+    return f"{signing_input}.{_b64url(sig)}"
 
 
 async def _wait_port(host: str, port: int, timeout: float = 20.0) -> None:
@@ -190,8 +218,9 @@ async def main() -> int:
             "--log-level", "warning", cwd=root))
         await _wait_port("127.0.0.1", STUB_PORT)
 
-        print("· starting relay/relay_client.py (echo agent, identity alice@example.com)")
-        env = {**os.environ, "RELAY_URL": RELAY_WS, "RELAY_IDENTITY": ALLOWED_EMAIL}
+        print("· starting relay/relay_client.py (echo agent, device-JWT for alice@example.com)")
+        env = {**os.environ, "RELAY_URL": RELAY_WS,
+               "RELAY_DEVICE_TOKEN": device_jwt(ALLOWED_EMAIL, jti="alice-oauth-test")}
         relay_client = os.path.join(root, "relay", "relay_client.py")
         procs.append(await asyncio.create_subprocess_exec(py, relay_client, env=env))
         await asyncio.sleep(2.0)  # let the agent register its WS

@@ -17,13 +17,17 @@ HTTP-over-WebSocket tunnel, which is only possible *because* every tool call is 
 single JSON response (no SSE stream to keep alive). The whole class of cloudflared
 QUIC/SSE drops (CLAUDE.md lesson #3) simply cannot happen here.
 
-STEP 1 is transport-only: the app exposes a single `echo` tool and identity is a
-stub header. Step 3 swaps the stub for a signed device-JWT; step 4 swaps the echo
-app for the real Facebook tools (same app object, same transport).
+The app exposes a single `echo` tool; step 4 swaps it for the real Facebook tools
+(same app object, same transport). Identity on the real Worker comes from a signed
+**device-JWT** (`RELAY_DEVICE_TOKEN`): we present it as `Authorization: Bearer …` on
+the WebSocket upgrade, and the Worker derives the routing identity from its verified
+`sub`. The legacy `X-Relay-Identity` header is still sent for the offline mock relay
+(scripts/mock_relay.py), which the real Worker ignores.
 
 Env:
-  RELAY_URL       wss://mcp.<domain>/agent   (default ws://127.0.0.1:8787/agent)
-  RELAY_IDENTITY  routing key; step-1 stub   (default "default")
+  RELAY_URL           wss://mcp.<domain>/agent   (default ws://127.0.0.1:8787/agent)
+  RELAY_DEVICE_TOKEN  signed device-JWT minted by `finder` (real Worker; default none)
+  RELAY_IDENTITY      legacy routing key for the mock relay only (default "default")
 """
 from __future__ import annotations
 
@@ -41,7 +45,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 log = logging.getLogger("relay")
 
 RELAY_URL = os.environ.get("RELAY_URL", "ws://127.0.0.1:8787/agent")
-RELAY_IDENTITY = os.environ.get("RELAY_IDENTITY", "default")  # step-1 stub
+RELAY_DEVICE_TOKEN = os.environ.get("RELAY_DEVICE_TOKEN", "")    # signed device-JWT
+RELAY_IDENTITY = os.environ.get("RELAY_IDENTITY", "default")    # legacy mock routing
 RECONNECT_MIN, RECONNECT_MAX = 1, 30
 MAX_FRAME = 16 * 1024 * 1024
 
@@ -90,15 +95,26 @@ async def _dispatch(client: httpx.AsyncClient, env: dict) -> dict:
     }
 
 
+def _connect_headers() -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if RELAY_DEVICE_TOKEN:
+        headers["Authorization"] = f"Bearer {RELAY_DEVICE_TOKEN}"
+    # Only the offline mock relay honors this; the real Worker ignores it and routes
+    # on the device-JWT `sub`.
+    headers["X-Relay-Identity"] = RELAY_IDENTITY
+    return headers
+
+
 async def _serve_connection(client: httpx.AsyncClient) -> None:
     async with websockets.connect(
         RELAY_URL,
-        additional_headers={"X-Relay-Identity": RELAY_IDENTITY},
+        additional_headers=_connect_headers(),
         max_size=MAX_FRAME,
         ping_interval=20,
         ping_timeout=20,
     ) as ws:
-        log.info("registered with relay %s as %r", RELAY_URL, RELAY_IDENTITY)
+        who = RELAY_IDENTITY if not RELAY_DEVICE_TOKEN else "device-JWT"
+        log.info("registered with relay %s (%s)", RELAY_URL, who)
         send_q: asyncio.Queue[str] = asyncio.Queue()
 
         async def writer() -> None:  # single writer → safe concurrent sends

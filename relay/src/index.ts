@@ -46,6 +46,7 @@ export interface Env {
   GOOGLE_CLIENT_SECRET: string;
   MCP_ALLOWED_EMAILS: string;
   PUBLIC_URL: string;
+  RELAY_JWT_SECRET: string; // HS256 secret for device tokens (Mac → /agent)
   GOOGLE_AUTH_URL?: string;
   GOOGLE_TOKEN_URL?: string;
   GOOGLE_USERINFO_URL?: string;
@@ -56,6 +57,7 @@ const AGENT_TIMEOUT_MS = 30_000;
 const ACCESS_TOKEN_TTL = 60 * 60 * 24; // 1 day, matching the old oauth.py
 const AUTHZ_STATE_PREFIX = "authz_state:";
 const AUTHZ_STATE_TTL = 300; // 5 min — an in-flight authorize request is short-lived
+const DEVICE_AUD = "relay-agent"; // device tokens carry this aud (≠ access tokens)
 
 // Headers we never forward down to the Mac: routing/authority framing and the
 // bearer token (the Mac app runs open behind the relay; it has no use for it).
@@ -92,14 +94,25 @@ const defaultHandler = {
       return new Response("ok\n", { headers: { "content-type": "text/plain" } });
     }
 
-    // Mac agent registers here. STEP 2 still uses the X-Relay-Identity stub;
-    // Step 3 verifies a device-JWT and routes on its `sub`.
+    // Mac agent registers here. Identity comes ONLY from a verified device-JWT
+    // (HS256, signed by finder with RELAY_JWT_SECRET) — never a client header
+    // (security invariant #1). The token is a secret carried in Authorization.
     if (url.pathname === "/agent") {
       if (request.headers.get("Upgrade") !== "websocket") {
         return new Response("expected websocket upgrade", { status: 426 });
       }
-      const identity = (request.headers.get(IDENTITY_HEADER) ?? "default").toLowerCase();
-      const id = env.RELAY.idFromName(identity);
+      const auth = request.headers.get("Authorization") || "";
+      const token = /^bearer /i.test(auth) ? auth.slice(7).trim() : "";
+      const claims = token ? await verifyDeviceJWT(token, env.RELAY_JWT_SECRET) : null;
+      if (!claims) {
+        // Refuse the upgrade. An opaque access token can't pass here (not a JWT),
+        // keeping access ≠ device tokens separated by construction (invariant #3).
+        return new Response("invalid or missing device token", { status: 401 });
+      }
+      if (await isRevoked(env, claims)) {
+        return new Response("device token revoked", { status: 401 });
+      }
+      const id = env.RELAY.idFromName(claims.sub);
       return env.RELAY.get(id).fetch(request);
     }
 
@@ -267,6 +280,88 @@ export class RelayDO {
     ws.addEventListener("close", drop);
     ws.addEventListener("error", drop);
   }
+}
+
+// ── device-JWT verification (Mac → /agent) ────────────────────────────────────
+interface DeviceClaims {
+  sub: string; // lowercased email — the routing key
+  jti?: string;
+}
+
+/**
+ * Verify an HS256 device token. Returns the claims, or null on ANY failure.
+ *
+ * Hard rules (security invariant #2): pinned alg HS256 (reject `alg:none` and any
+ * other alg), valid HMAC signature over `RELAY_JWT_SECRET`, `aud == "relay-agent"`,
+ * a non-empty `sub`, and `exp` (if present) not in the past. `exp` is optional —
+ * device tokens are long-lived; revocation is handled by the KV denylist, not expiry.
+ */
+async function verifyDeviceJWT(token: string, secret: string): Promise<DeviceClaims | null> {
+  if (!secret) return null;
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  const [h, p, sig] = parts;
+
+  let header: { alg?: string; typ?: string };
+  let payload: { sub?: unknown; aud?: unknown; exp?: unknown; jti?: unknown };
+  try {
+    header = JSON.parse(b64urlToString(h));
+    payload = JSON.parse(b64urlToString(p));
+  } catch {
+    return null;
+  }
+  if (header?.alg !== "HS256") return null; // pin the algorithm — reject none/RS256/etc.
+  if (header?.typ && header.typ !== "JWT") return null;
+
+  let ok = false;
+  try {
+    const key = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(secret),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["verify"],
+    );
+    ok = await crypto.subtle.verify(
+      "HMAC",
+      key,
+      b64urlToBytes(sig),
+      new TextEncoder().encode(`${h}.${p}`),
+    );
+  } catch {
+    return null;
+  }
+  if (!ok) return null;
+
+  if (payload?.aud !== DEVICE_AUD) return null;
+  if (typeof payload?.sub !== "string" || !payload.sub) return null;
+  if (payload.exp != null && Math.floor(Date.now() / 1000) > Number(payload.exp)) return null;
+
+  return {
+    sub: payload.sub.toLowerCase(),
+    jti: typeof payload.jti === "string" ? payload.jti : undefined,
+  };
+}
+
+/** A device token is revoked if its email (`sub`) or `jti` is on the KV denylist. */
+async function isRevoked(env: Env, claims: DeviceClaims): Promise<boolean> {
+  const lookups = [env.RELAY_KV.get(`revoked:sub:${claims.sub}`)];
+  if (claims.jti) lookups.push(env.RELAY_KV.get(`revoked:jti:${claims.jti}`));
+  const hits = await Promise.all(lookups);
+  return hits.some((v) => v !== null);
+}
+
+function b64urlToBytes(s: string): Uint8Array {
+  const b64 = s.replace(/-/g, "+").replace(/_/g, "/");
+  const pad = b64.length % 4 === 0 ? "" : "=".repeat(4 - (b64.length % 4));
+  const bin = atob(b64 + pad);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+function b64urlToString(s: string): string {
+  return new TextDecoder().decode(b64urlToBytes(s));
 }
 
 // ── base64 <-> ArrayBuffer (Workers have btoa/atob, not Buffer) ────────────────
