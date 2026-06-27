@@ -26,15 +26,19 @@
     { "binding": "RELAY_KV", "id": "REPLACE_WITH_RELAY_KV_ID" }
   ],
 
-  // Non-secret config. PUBLIC_URL is the relay's public base; set it to the real
-  // hostname before deploy. Secrets (GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET,
-  // MCP_ALLOWED_EMAILS, and the Step-3 RELAY_JWT_SECRET) are set via
-  // `wrangler secret put`, never committed. For local dev, put them in
-  // relay/.dev.vars (gitignored).
+  // Non-secret config. PUBLIC_URL is the relay's public base (issuer + Google
+  // redirect origin). Secrets (GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET,
+  // MCP_ALLOWED_EMAILS, RELAY_JWT_SECRET) are set via `wrangler secret put`, never
+  // committed. For local dev, put them in relay/.dev.vars (gitignored).
   "vars": {
-    "PUBLIC_URL": "http://127.0.0.1:8787"
-  }
+    "PUBLIC_URL": "https://mcp.wynnset.com"
+  },
 
-  // Step 5: route the custom hostname here, e.g.
-  // "routes": [{ "pattern": "mcp.wynnset.com", "custom_domain": true }]
+  // Single public endpoint for every friend's Mac. custom_domain makes wrangler
+  // provision the hostname + its DNS on deploy. NOTE: mcp.wynnset.com is currently
+  // the old cloudflared tunnel host — that DNS record must be removed first or the
+  // custom-domain creation will conflict (see docs/RELAY_DEPLOY.md → cutover).
+  "routes": [
+    { "pattern": "mcp.wynnset.com", "custom_domain": true }
+  ]
 }
