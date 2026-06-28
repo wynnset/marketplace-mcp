@@ -16,67 +16,86 @@ that project's proven Playwright scraping approach.
 
 ## Architecture (and why)
 
+**Current (relay model — live at `https://mcp.wynnset.com/mcp`):** one shared
+Cloudflare Worker + Durable Object is the single public endpoint for *everyone*.
+It runs the OAuth authorization server (Google sign-in) and routes each request to
+the right person's Mac by **identity**. Each Mac runs an **outbound** agent that
+dials the relay over a WebSocket — no inbound tunnel, no public address per Mac.
+
 ```
-claude.ai ──HTTPS──▶ cloudflared tunnel ──▶ local MCP server (this, on the Mac)
-                                                  │
-                                                  ▼
-                                   logged-in Chromium (Playwright persistent ctx)
-                                                  │
-                                                  ▼
-                                         Facebook Marketplace
+claude.ai ──HTTPS + Bearer──▶ Cloudflare Worker (mcp.<domain>)      [relay/]
+                               │  OAuth gate (Google) → route by sub=email
+                               ▼  Durable Object per identity
+        Alice's Mac ──outbound WSS + device-JWT──▶ DO(alice)         [relay/relay_client.py]
+                               │  replays each request into the real FastMCP app
+                               ▼
+                   logged-in Chromium (Playwright persistent ctx) ──▶ Facebook Marketplace
 ```
 
-- claude.ai can only reach an MCP server over **HTTP**.
-- Facebook only shows real results to a **real, logged-in browser**.
-- So the server runs **locally** (Streamable-HTTP transport) and is exposed to
-  claude.ai via a **tunnel**. The user adds `https://<tunnel-host>/mcp` as a
-  claude.ai custom connector.
+- claude.ai can only reach an MCP server over **HTTP**, and only authenticates via **OAuth**.
+- Facebook only shows real results to a **real, logged-in browser** on the user's Mac.
+- The Worker terminates claude.ai's TLS + OAuth; the Mac's agent makes an *outbound*
+  connection, so the Mac needs no tunnel or open port. The user adds one URL
+  (`https://mcp.<domain>/mcp`) to claude.ai and signs in with Google.
+- See `docs/RELAY_MIGRATION.md` (design, locked decisions) and `docs/RELAY_DEPLOY.md`
+  (deploy runbook). The two meet at `DO(email)`: the access-token `sub` (claude.ai
+  side) and the device-JWT `sub` (Mac side) must be the **same email**.
+
+**Historical (pre-relay, superseded):** each Mac ran the FastMCP server locally and
+exposed it via its *own* cloudflared named tunnel (`https://mcp.<domain>/mcp` →
+tunnel → local server). This is why lessons #1 and #3 below existed; the relay
+retired both. `src/server.py serve` still runs that standalone path if ever needed.
 
 ## Files
 
-Layout: the importable app lives in **`src/`** (run as `python src/server.py`);
-dev/build helpers in **`scripts/`**; long-form docs in **`docs/`**; the WIP
-reverse-tunnel transport in **`relay/`**. `finder` stays at the repo root (it's
-the entry point) and runtime data (`.browser-profile/`, `.oauth-store.json`,
-`server.log`, `.geocode-cache.json`, `logs/`, `.venv/`) lives at the root too —
+Layout: the importable app lives in **`src/`**; the Cloudflare Worker relay +
+Mac-side agent in **`relay/`**; dev/build helpers + test harness in **`scripts/`**;
+long-form docs in **`docs/`**. `finder` stays at the repo root (it's the entry
+point) and runtime data (`.browser-profile/`, `server.log`, `.geocode-cache.json`,
+`logs/`, `.venv/`, `.finder.env`, `.provision/`) lives at the root too —
 `src/server.py` resolves `ROOT` to its parent so these paths are unchanged.
 
 | File | Purpose |
 |---|---|
-| `finder` | **bash CLI** (repo root) that installs/runs/manages everything: deps, FB login, the permanent Cloudflare named tunnel, and the launchd auto-start services. Start here for anything operational. |
-| `src/server.py` | Everything else: FastMCP server, the two tools, and the `login` CLI. Wires in the OAuth gate when `GOOGLE_CLIENT_ID` is set. |
-| `src/oauth.py` | The OAuth 2.1 authorization-server gate, fronted by **Google sign-in** (email allowlist). Only loaded when OAuth is configured. See "Auth" below. |
+| `finder` | **bash CLI** (repo root) that installs/runs/manages the **relay agent** on a Mac: deps, FB login, and the one launchd auto-start LaunchAgent that runs `relay/relay_client.py` (under `caffeinate`). Also `provision <email>` (operator). Start here for anything operational. |
+| `relay/src/index.ts` | The **Cloudflare Worker + Durable Object**: OAuth authorization server (built on `@cloudflare/workers-oauth-provider`), `/mcp` resource (routes on verified `ctx.props.sub`), `/agent` device-JWT intake, single-active-agent per identity, KV revocation denylist. |
+| `relay/src/google_gate.ts` | The Google sign-in + email-allowlist gate (TS port of `src/oauth.py`'s human gate). |
+| `relay/relay_client.py` | The **Mac-side agent**: dials the relay outbound over WSS with a device-JWT, replays each forwarded request into `src/server.py`'s real FastMCP app. Auto-reconnect; holds the lifespan (pre-warmed browser) open across reconnects. |
+| `relay/wrangler.jsonc` | Worker config: DO + KV bindings, `PUBLIC_URL`, `custom_domain` route for `mcp.<domain>`. Secrets via `wrangler secret put` (`GOOGLE_*`, `MCP_ALLOWED_EMAILS`, `RELAY_JWT_SECRET`). |
+| `src/server.py` | FastMCP server, the two tools, the `login` CLI, and the module-level `app` the relay agent imports. Standalone `serve` still works (legacy/local). |
+| `src/devtoken.py` | Mints HS256 device tokens (`finder provision` uses it); the Worker verifies them on `/agent`. |
+| `src/oauth.py` | **Legacy** — the in-process OAuth gate for the standalone `serve` path. Superseded by the Worker's OAuth for the relay model; kept for standalone use. |
 | `src/gazetteer.py` | **Generated** offline city→(lat,lng) table (~1500: top 1000 US + top 500 CA by population) for the server-side radius filter. Keyed by accent-stripped, `St.`→`Saint`-normalized city name. Committed (it's data). |
-| `scripts/build_gaz.py` | Regenerates `src/gazetteer.py` from the GeoNames `cities1000` dump (public domain). Re-run if you want more/different cities. |
-| `scripts/mock_relay.py`, `scripts/test_echo.py` | Offline test harness for the `relay/` transport. |
+| `scripts/build_gaz.py` | Regenerates `src/gazetteer.py` from the GeoNames `cities1000` dump (public domain). |
+| `scripts/mock_relay.py` · `scripts/stub_oidc.py` | Offline stand-ins (the Worker+DO; Google's OIDC) for the test harness. |
+| `scripts/test_echo.py` · `test_oauth.py` · `test_identity.py` | Relay harness: transport round-trip; OAuth gate (discovery, 401+`WWW-Authenticate`, allowlist); device-JWT identity routing + isolation + revocation. |
 | `requirements.txt` | `mcp`, `playwright`, `uvicorn`, `httpx` (httpx is for the Google token exchange + Nominatim geocoding). |
-| `README.md` | Short overview + setup. |
-| `docs/DEPLOY.md` | Full step-by-step deploy/use walkthrough + troubleshooting. |
+| `docs/RELAY_MIGRATION.md` · `docs/RELAY_DEPLOY.md` | Relay design (locked decisions) + the deploy/cutover runbook. |
+| `docs/DEPLOY.md` | The **legacy** cloudflared-tunnel walkthrough (pre-relay). |
 | `.browser-profile/` | **gitignored** — the logged-in FB session. Never commit. |
-| `.finder.env` | **gitignored** — tunnel hostname + Google OAuth client id/secret/emails (chmod 600). |
-| `.oauth-store.json` | **gitignored** — persisted OAuth clients + issued access/refresh tokens (chmod 600), so a server restart doesn't force a claude.ai reconnect. |
-| `logs/` | **gitignored** — launchd stdout/stderr for the server + tunnel services. |
-| `server.log` | **gitignored** — runtime log (`tail -f` it to watch searches). |
+| `.finder.env` | **gitignored** (chmod 600) — `RELAY_URL` + `RELAY_DEVICE_TOKEN` (this Mac's agent creds); on the operator's Mac also `RELAY_JWT_SECRET` + `GOOGLE_*` + `MCP_ALLOWED_EMAILS`. |
+| `.provision/` | **gitignored** — per-friend device-token bundles from `finder provision`. Secrets. |
+| `logs/` · `server.log` | **gitignored** — launchd stdout/stderr (`logs/agent.*.log`) + the runtime log (`tail -f server.log` to watch searches). |
 
 ### The `finder` CLI (the easy path — prefer it over manual steps)
 
 `./finder install` is one idempotent command: venv+deps+Chromium → FB login (if
-needed) → **named Cloudflare tunnel** routed to `mcp.<domain>` (permanent URL) →
-**launchd services** that auto-start at login and self-heal. Other subcommands:
-`status` (health + the connector URL), `logs`, `start`/`stop`/`restart`,
-`login` (re-auth FB; stops the server first so it releases the profile),
-`url`, `uninstall`.
+needed) → require `RELAY_URL` + `RELAY_DEVICE_TOKEN` in `.finder.env` → install the
+**one launchd agent** that auto-starts at login and self-heals. Subcommands:
+`status` (agent health + connector URL), `logs`, `start`/`stop`/`restart`,
+`login` (re-auth FB; stops the agent first so it releases the profile), `url`,
+`uninstall`, and `provision <email>` (operator: mint a friend's device-token bundle).
 
-Two LaunchAgents live in `~/Library/LaunchAgents`:
-`com.wynnset.finder.server` (runs `.venv/bin/python src/server.py serve`) and
-`com.wynnset.finder.tunnel` (runs `cloudflared tunnel --config
-~/.cloudflared/marketplace-mcp.yml run`). Both `KeepAlive` + `RunAtLoad`; the CLI
-controls them via `launchctl bootstrap/bootout gui/$(id -u) …`.
+One LaunchAgent lives in `~/Library/LaunchAgents`: `com.wynnset.finder.server`
+(label kept for continuity) now runs `caffeinate -is .venv/bin/python
+relay/relay_client.py` with `RELAY_URL` + `RELAY_DEVICE_TOKEN` in its env.
+`KeepAlive` + `RunAtLoad`; `caffeinate` keeps a closed-lid Mac answering. The CLI
+controls it via `launchctl bootstrap/bootout gui/$(id -u) …`. (The old
+`com.wynnset.finder.tunnel` cloudflared agent is removed on install/uninstall.)
 
-**Permanent host ⇒ DNS-rebinding protection is back ON.** The server LaunchAgent
-sets `MCP_ALLOWED_HOSTS=<your hostname>`, so the SDK pins the Host header. This is
-only possible because the named tunnel's host is stable — the old quick-tunnel URL
-rotated, which is why protection had to be off (see lesson #1 below).
+**Identity match:** the email a friend signs into Google with **must** equal the
+email you `provision`ed their device token with, and be on the Worker allowlist
+(`MCP_ALLOWED_EMAILS`).
 
 ## Tools
 
@@ -116,15 +135,20 @@ allowlist) · `MCP_PUBLIC_URL` (public base URL; auto-derived from
 
 ## Run / deploy
 
+**Relay model (current).** Deploy the Worker once, then run the agent per Mac:
+
 ```bash
-python src/server.py serve
-cloudflared tunnel --protocol http2 --url http://localhost:8000   # note: http2!
-# add https://<tunnel-host>/mcp as a claude.ai custom connector
+cd relay && npx wrangler deploy            # Worker → mcp.<domain> (see docs/RELAY_DEPLOY.md)
+./finder provision <email>                 # operator: mint a friend's device-token bundle
+./finder install                           # per Mac: deps, FB login, auto-start agent
+# friend adds https://mcp.<domain>/mcp in claude.ai and signs in with Google
 ```
 
-Quick-tunnel URLs **rotate on every restart** → re-paste into claude.ai each time.
-For a permanent URL, use a named Cloudflare tunnel + your own domain (see
-docs/DEPLOY.md → "Stable URL").
+The Mac's agent (`relay/relay_client.py`) keeps `stateless_http` + `json_response`
+and DNS-rebinding protection **OFF** (no public host to pin — the Worker owns that).
+
+**Legacy standalone** (no relay): `python src/server.py serve` + a cloudflared
+tunnel — see `docs/DEPLOY.md`. Only relevant if you ever bypass the relay.
 
 ---
 
@@ -136,26 +160,30 @@ transport problems, not server/Facebook problems.** Confirm the server side firs
 fine and the issue is the tunnel/transport. claude.ai's own error messages blamed
 "login walls / CAPTCHA" and these were **wrong** every time.
 
-The four fixes, all currently in `src/server.py` / the run command — do **not** regress them:
+Lessons #2/#4/#5 are **still live** (in `src/server.py`). Lessons #1 and #3 are
+**historical — superseded by the relay** (no per-Mac tunnel/Host anymore), but the
+fixes they motivated (`stateless_http` + `json_response`) are still load-bearing and
+must not regress — the relay is a pure request/response proxy *because* of them.
 
-1. **DNS-rebinding protection → HTTP 421.** The MCP SDK only trusts `localhost`
-   by default and rejects the tunnel's `Host` header with 421. Fixed via
-   `TransportSecuritySettings` (default: protection OFF; set `MCP_ALLOWED_HOSTS`
-   to re-pin). See the `_security` block.
+1. **[HISTORICAL — relay retired this] DNS-rebinding protection → HTTP 421.** The MCP
+   SDK only trusts `localhost` and rejected the tunnel's `Host` header with 421. Fixed
+   via `TransportSecuritySettings` (protection OFF; `MCP_ALLOWED_HOSTS` to re-pin). In
+   the relay model the Worker terminates claude.ai's Host/TLS and the Mac app has no
+   public host, so protection stays OFF on the Mac and there's nothing to pin.
 
 2. **Cold-start timeout.** The first search cold-started Chromium (~seconds) and
    blew past claude.ai's tool wait → cancel. Fixed with a **lifespan pre-warm**
-   (`_lifespan` launches the browser at startup) + trimmed page waits.
+   (`_lifespan` launches the browser at startup) + trimmed page waits. **Still live** —
+   `relay_client.py` holds the lifespan open across reconnects so the browser stays warm.
 
-3. **The tunnel was THE recurring failure.** The Cloudflare quick tunnel uses
-   **QUIC**, which kept dropping (`no recent network activity`) and reconnecting;
-   the MCP server's **long-lived SSE session stream** died on each reconnect, so
-   claude.ai hung waiting (up to its 5-minute timeout). Tunnel-log tell:
-   `stream canceled by remote with error code 0` = the client gave up. Fixed with
-   **all three** together:
+3. **[HISTORICAL — relay retired this] The tunnel was THE recurring failure.** The
+   cloudflared quick tunnel used **QUIC**, which dropped and reconnected, killing the
+   MCP server's long-lived SSE session stream so claude.ai hung. The relay deletes this
+   entire class of bug: the Mac dials *outbound* and every tool call is one independent
+   request/response. The two fixes that made that possible are **still load-bearing**:
    - `stateless_http=True` — no persistent session/stream to drop.
    - `json_response=True` — single JSON response, can't be truncated mid-stream.
-   - tunnel `--protocol http2` — eliminates the QUIC idle timeouts.
+   - (the old tunnel `--protocol http2` workaround is gone with cloudflared.)
 
 4. **FB DOM is obfuscated** — parsing is heuristic: price by regex
    (`(?:CA)?\$[\d,]+`), title = first non-price line, location = last line.
@@ -222,10 +250,21 @@ URL. The public path was validated separately and works.
   blocks datacenter IPs → must be scraped through the same real browser.
 ## Auth (how the server is locked down)
 
-The endpoint is open unless `GOOGLE_CLIENT_ID` is set; `./finder install` walks
-you through turning it on. When on, **`src/oauth.py` runs a minimal OAuth 2.1
-authorization server *inside* this MCP server**, and the human gate is **Google
-sign-in restricted to `MCP_ALLOWED_EMAILS`**. Flow:
+**Relay model (current):** auth runs in the **Worker**, not on the Mac. The Mac's
+agent is reachable *only* through the authenticated relay, so `src/server.py`'s app
+runs **open** locally (the relay agent clears `GOOGLE_CLIENT_ID`/`MCP_AUTH_TOKEN`
+before importing it). The Worker is the gate: `@cloudflare/workers-oauth-provider`
+issues opaque access tokens (claude.ai → `/mcp`), and `relay/src/google_gate.ts` is
+the Google sign-in + allowlist gate (TS port of the `src/oauth.py` logic below). The
+Mac→`/agent` leg uses a separate HS256 device-JWT (shared `RELAY_JWT_SECRET`), not
+OAuth. Token strategy + invariants: `docs/RELAY_MIGRATION.md`. The claude.ai-critical
+RFC 9728 `WWW-Authenticate: …resource_metadata=…` header is emitted by the library —
+if "Connect" fails with no login screen, check that header on the 401 from `/mcp`.
+
+**Legacy standalone (below) — `src/oauth.py`:** when `GOOGLE_CLIENT_ID` is set on a
+standalone `serve`, **`src/oauth.py` runs a minimal OAuth 2.1 authorization server
+*inside* this MCP server**, gated by **Google sign-in restricted to
+`MCP_ALLOWED_EMAILS`**. The Worker's gate was ported from it; the why is identical. Flow:
 
 ```
 claude.ai ──/authorize──▶ this server ──redirect──▶ Google sign-in
