@@ -58,6 +58,10 @@ FINDER_HOSTNAME="$FINDER_HOSTNAME"
 GOOGLE_CLIENT_ID="${GOOGLE_CLIENT_ID:-}"
 GOOGLE_CLIENT_SECRET="${GOOGLE_CLIENT_SECRET:-}"
 MCP_ALLOWED_EMAILS="${MCP_ALLOWED_EMAILS:-}"
+# Relay model (Step 5): the agent dials this URL; RELAY_JWT_SECRET is shared with
+# the relay Worker (wrangler secret put RELAY_JWT_SECRET). Preserved across re-runs.
+RELAY_URL="${RELAY_URL:-}"
+RELAY_JWT_SECRET="${RELAY_JWT_SECRET:-}"
 EOF
   chmod 600 "$CONFIG" 2>/dev/null || true
 }

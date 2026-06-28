@@ -22,8 +22,8 @@
   // and uses a local store; fill real ids (`wrangler kv namespace create`) before
   // deploying in Step 5.
   "kv_namespaces": [
-    { "binding": "OAUTH_KV", "id": "REPLACE_WITH_OAUTH_KV_ID" },
-    { "binding": "RELAY_KV", "id": "REPLACE_WITH_RELAY_KV_ID" }
+    { "binding": "OAUTH_KV", "id": "5528ced95173472ea7b544c17188c85e" },
+    { "binding": "RELAY_KV", "id": "c1277ed6a8d94b89b431059c2f1c8119" }
   ],
 
   // Non-secret config. PUBLIC_URL is the relay's public base (issuer + Google
